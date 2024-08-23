@@ -15,4 +15,4 @@ async def on_ready():
     user = await client.fetch_user()
     await user.send("<DiscordInviteLink>")
 
-client.run("MTI3NjM1NTUzOTIzMTgzNDI2Mw.GiOhvI.o4jvmvi_5XgvNPJ5TAOXEkvF_YOy9Z0Eh7QGUg")
+client.run("Bot Token")
