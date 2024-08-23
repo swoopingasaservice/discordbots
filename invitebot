@@ -1,13 +1,27 @@
 import discord
-import user_IDs
+from discord.ext import commands
+import asyncio
 
 
+intents = discord.Intents.default()
 client = discord.Client(intents=discord.Intents.default())
+bot = commands.Bot(command_prefix='/', intents=intents)
+
+
+
+####user IDs and messages to send to users#####
 
 @client.event
 async def on_ready():
-    user = await client.fetch_user('<DiscordUserID>')
+    ###subscriber list- "Example server"####
+    user = await client.fetch_user('572314753104478228')
+    
+    
+    ###Server invite and info####
     await user.send("<DiscordInviteLink>")
+    await user.send("Owned by:<YourMessage>"), 
+    await user.send("Category:<YourMessage>"),
+    await user.send("Appx. DOB <YourMessage>"), 
 
 
 
