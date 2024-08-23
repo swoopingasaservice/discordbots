@@ -49,7 +49,7 @@ async def _space(ctx: discord.interactions.Interaction):
     await user.send("Owned by:<YourMessage>"), 
     await user.send("Category:<YourMessage>"),
     await user.send("Appx. DOB:<YourMessage>"), 
-    await ctx.response.send_message(f"Hello")
+    await ctx.response.send_message(f"Invites have been sent!")
 
 
 #####Subscribers for server #1####
