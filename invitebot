@@ -6,7 +6,7 @@ client = discord.Client(intents=discord.Intents.default())
 
 @client.event
 async def on_ready():
-    user = await client.fetch_user(<DiscordUserID>)
+    user = await client.fetch_user('<DiscordUserID>')
     await user.send("<DiscordInviteLink>")
 
 
