@@ -1,0 +1,58 @@
+import discord
+from discord.ext import commands
+import asyncio
+import subprocess
+from dotenv import load_dotenv
+import os
+
+intents = discord.Intents.default()
+client = discord.Client(intents=discord.Intents.default())
+client = commands.Bot(command_prefix='/', intents=intents)
+
+load_dotenv()
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+SubscriberList1 = os.getenv('SubscriberList1')
+####user IDs and messages to send to users#####
+
+@client.event
+async def on_message(message):
+    
+
+    # Ignore messages from the bot itself
+    if message.author == client.user:
+        return
+
+    # Check if the message starts with a specific command prefix
+    if message.content.startswith('/invite1'):
+        
+            ###Server invite and info####
+        await user.send("<DiscordInviteLink>")
+        await user.send("Owned by:<YourMessage>"), 
+        await user.send("Category:<YourMessage>"),
+        await user.send("Appx. DOB:<YourMessage>"), 
+         
+            ###subscriber list- "Example server"####
+        user = await client.fetch_user(SubscriberList1)
+
+    
+    await client.tree.sync()
+
+
+#DEFINECommands####
+@client.tree.command(name="invite1", description="Invites users on subscriber list to the server.")
+async def _space(ctx: discord.interactions.Interaction):
+        
+        ###subscriber list- "Example server"####
+    user = await client.fetch_user(SubscriberList1)
+    ###Server invite and info####
+    await user.send("<DiscordInviteLink>")
+    await user.send("Owned by:<YourMessage>"), 
+    await user.send("Category:<YourMessage>"),
+    await user.send("Appx. DOB:<YourMessage>"), 
+    await ctx.response.send_message(f"Hello")
+
+
+#####Subscribers for server #1####
+SubscriberList1 = (SubscriberList1)
+
+client.run(DISCORD_TOKEN)
