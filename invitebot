@@ -10,9 +10,6 @@ async def on_ready():
     await user.send("<DiscordInviteLink>")
 
 
-@client.event
-async def on_ready():
-    user = await client.fetch_user()
-    await user.send("<DiscordInviteLink>")
+
 
 client.run("Bot Token")
