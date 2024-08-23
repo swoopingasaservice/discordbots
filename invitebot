@@ -14,7 +14,7 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 @client.event
 async def on_ready():
     ###subscriber list- "Example server"####
-    user = await client.fetch_user('572314753104478228')
+    user = await client.fetch_user('<DISCORDUSERID')
     
     
     ###Server invite and info####
