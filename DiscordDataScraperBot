@@ -4,7 +4,7 @@ import re  # Import the re module for regular expressions
 import io
 
 # Replace 'your_token_here' with your bot's token
-TOKEN = '<TOKENOR.ENVLINK'
+TOKEN = '<TOKENOR.ENVLINK>'
 
 
 intents = discord.Intents.default()
