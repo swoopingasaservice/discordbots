@@ -1,0 +1,49 @@
+import discord
+from discord.ext import commands
+import re  # Import the re module for regular expressions
+import io
+
+# Replace 'your_token_here' with your bot's token
+TOKEN = '<TOKENOR.ENVLINK'
+
+
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True  # Required for reading message content
+intents.dm_messages = True  # Required for reading DM messages
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
+    await bot.tree.sync()  # Sync commands with Discord
+    print('Commands synced!')
+
+@bot.tree.command(name="extract_dms", description="Extracts all DMs with a specified user.")
+async def extract_dms(interaction: discord.Interaction, user: discord.User):
+    """Extracts all direct messages between the bot and a specified user."""
+    
+    # Create a DM channel if it doesn't exist
+    dm_channel = await user.create_dm()
+
+    # Sanitize the filename
+    safe_username = re.sub(r'[<>:"/\\|?*]', '', user.name)  # Remove invalid characters
+    filename = f'dms_with_{safe_username}.txt'
+
+    # Create a string buffer to hold the DMs
+    buffer = io.StringIO()
+
+    # Collect DMs
+    async for message in dm_channel.history(limit=None):
+        buffer.write(f'{message.created_at}: {message.content}\n')
+
+    # Move to the beginning of the StringIO buffer
+    buffer.seek(0)
+
+    # Send the file in the channel
+    await interaction.response.send_message(
+        content=f'DMs with {user.name} have been extracted.',
+        file=discord.File(fp=buffer, filename=filename)
+    )
+bot.run(TOKEN)
