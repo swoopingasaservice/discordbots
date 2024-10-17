@@ -1,0 +1,55 @@
+import discord
+from discord import app_commands
+
+DISCORD_TOKEN = 'your_bot_token_here'
+
+class MyClient(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
+client = MyClient()
+
+@client.event
+async def on_ready():
+    print(f'{client.user} has connected to Discord!')
+
+@client.tree.command(name="ban", description="Ban a user by their ID")
+@app_commands.describe(user_id="The ID of the user to ban")
+@app_commands.describe(reason="The reason for the ban")
+async def ban_user(interaction: discord.Interaction, user_id: str, reason: str = "No reason provided"):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    try:
+        user_id = int(user_id)
+        user = await client.fetch_user(user_id)
+    except ValueError:
+        await interaction.response.send_message("Invalid user ID. Please provide a valid numeric ID.", ephemeral=True)
+        return
+    except discord.errors.NotFound:
+        await interaction.response.send_message("User not found. Please check the ID and try again.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+
+    try:
+        # Attempt to DM the user
+        try:
+            await user.send(f"You have been banned from {guild.name}. Reason: {reason}")
+        except discord.errors.Forbidden:
+            pass  # User has DMs closed or has blocked the bot
+
+        # Ban the user
+        await guild.ban(user, reason=f"Banned by {interaction.user}: {reason}")
+        await interaction.response.send_message(f"Successfully banned user {user} (ID: {user_id}). Reason: {reason}")
+    except discord.errors.Forbidden:
+        await interaction.response.send_message("I don't have permission to ban this user.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"An error occurred while trying to ban the user: {str(e)}", ephemeral=True)
+
+client.run(DISCORD_TOKEN)
