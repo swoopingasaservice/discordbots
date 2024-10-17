@@ -1,0 +1,167 @@
+import discord
+from discord import app_commands
+import sqlite3
+
+DISCORD_TOKEN = 'INSERT TOKEN HERE'
+
+# Connect to the SQLite database (it will create the file if it doesn't exist)
+conn = sqlite3.connect('banned_users.db')
+c = conn.cursor()
+
+# Create a table for banned users if it doesn't exist
+c.execute('''
+    CREATE TABLE IF NOT EXISTS banned_users (
+        user_id INTEGER PRIMARY KEY
+    )
+''')
+conn.commit()
+
+class MyClient(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
+client = MyClient()
+
+@client.event
+async def on_ready():
+    print(f'{client.user} has connected to Discord!')
+
+@client.tree.command(name="ban", description="Ban multiple users by their IDs or mentions")
+@app_commands.describe(users="The users to ban (mention or IDs)", reason="The reason for the ban")
+async def ban_users(interaction: discord.Interaction, users: str, reason: str = "No reason provided"):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    user_ids = []
+    for user in users.split(','):
+        user = user.strip()
+        if interaction.message.mentions:
+            user_ids.append(interaction.message.mentions[0].id)
+        else:
+            try:
+                user_ids.append(int(user))
+            except ValueError:
+                await interaction.response.send_message(f"Invalid user: {user}. Please provide valid IDs or mentions.", ephemeral=True)
+                return
+
+    guild = interaction.guild
+    for user_id in user_ids:
+        c.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (user_id,))
+        conn.commit()
+
+        try:
+            user = await client.fetch_user(user_id)
+            try:
+                await user.send(f"You have been banned from {guild.name}. Reason: {reason}")
+            except discord.Forbidden:
+                pass
+
+            await guild.ban(user, reason=f"Banned by {interaction.user}: {reason}")
+        except discord.NotFound:
+            await interaction.response.send_message(f"User ID {user_id} not found.", ephemeral=True)
+            continue
+        except Exception as e:
+            await interaction.response.send_message(f"An error occurred while trying to ban user ID {user_id}: {str(e)}", ephemeral=True)
+
+    await interaction.response.send_message(f"Successfully banned users: {', '.join(map(str, user_ids))}. Reason: {reason}")
+
+@client.event
+async def on_member_join(member):
+    c.execute('SELECT user_id FROM banned_users WHERE user_id = ?', (member.id,))
+    if c.fetchone() is not None:
+        await member.ban(reason="Banned by server staff.")
+        print(f"Banned {member} upon joining.")
+
+@client.tree.command(name="unban", description="Unban multiple users by their IDs")
+@app_commands.describe(users="The users to unban (IDs)")
+async def unban_users(interaction: discord.Interaction, users: str):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    user_ids = []
+    for user in users.split(','):
+        user = user.strip()
+        try:
+            user_ids.append(int(user))
+        except ValueError:
+            await interaction.response.send_message(f"Invalid user: {user}. Please provide valid numeric IDs.", ephemeral=True)
+            return
+
+    guild = interaction.guild
+    for user_id in user_ids:
+        try:
+            await guild.unban(discord.Object(id=user_id))
+            c.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
+            conn.commit()
+        except discord.NotFound:
+            await interaction.response.send_message(f"User ID {user_id} is not banned.", ephemeral=True)
+            continue
+        except Exception as e:
+            await interaction.response.send_message(f"An error occurred while trying to unban user ID {user_id}: {str(e)}", ephemeral=True)
+
+    await interaction.response.send_message(f"Successfully unbanned users: {', '.join(map(str, user_ids))}.")
+
+@client.tree.command(name="add_blacklist", description="Add multiple users to the blacklist by their IDs")
+@app_commands.describe(users="The users to add to the blacklist (IDs)")
+async def add_to_blacklist(interaction: discord.Interaction, users: str):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    user_ids = []
+    for user in users.split(','):
+        user = user.strip()
+        try:
+            user_ids.append(int(user))
+        except ValueError:
+            await interaction.response.send_message(f"Invalid user ID: {user}. Please provide valid numeric IDs.", ephemeral=True)
+            return
+
+    for user_id in user_ids:
+        c.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (user_id,))
+        conn.commit()
+
+    await interaction.response.send_message(f"Successfully added user IDs: {', '.join(map(str, user_ids))} to the blacklist.")
+
+@client.tree.command(name="remove_blacklist", description="Remove multiple users from the blacklist by their IDs")
+@app_commands.describe(users="The users to remove from the blacklist (IDs)")
+async def remove_from_blacklist(interaction: discord.Interaction, users: str):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    user_ids = []
+    for user in users.split(','):
+        user = user.strip()
+        try:
+            user_ids.append(int(user))
+        except ValueError:
+            await interaction.response.send_message(f"Invalid user ID: {user}. Please provide valid numeric IDs.", ephemeral=True)
+            return
+
+    for user_id in user_ids:
+        c.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
+        conn.commit()
+
+    await interaction.response.send_message(f"Successfully removed user IDs: {', '.join(map(str, user_ids))} from the blacklist.")
+
+@client.event
+async def on_close():
+    conn.close()
+
+@client.tree.command()
+@app_commands.guilds(discord.Object(id=1060316401925103766))
+async def sync(interaction: discord.Interaction):
+    if interaction.user.id == your_user_id:  # Only allow yourself to use this
+        await client.tree.sync(guild=discord.Object(id=your_guild_id))
+        await interaction.response.send_message("Commands synced.")
+
+client.run(DISCORD_TOKEN)
