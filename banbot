@@ -1,0 +1,45 @@
+import discord
+from discord import app_commands
+
+# Replace this with your actual bot token
+DISCORD_TOKEN = 'your_bot_token_here'
+# List of user IDs to ban
+BAN_LIST = ['user_id1', 'user_id2', 'user_id3']
+
+class MyClient(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
+client = MyClient()
+
+@client.event
+async def on_ready():
+    print(f'{client.user} has connected to Discord!')
+
+@client.tree.command(name="ban_users", description="Bans users on the ban list from the server.")
+async def ban_users(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    banned_count = 0
+    failed_count = 0
+
+    for user_id in BAN_LIST:
+        try:
+            user = await client.fetch_user(int(user_id))
+            await guild.ban(user, reason="Banned by bot command")
+            banned_count += 1
+        except discord.errors.NotFound:
+            failed_count += 1
+        except discord.errors.Forbidden:
+            failed_count += 1
+
+    await interaction.response.send_message(f"Banned {banned_count} users. Failed to ban {failed_count} users.")
+
+client.run(DISCORD_TOKEN)
