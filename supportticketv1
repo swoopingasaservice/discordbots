@@ -1,5 +1,3 @@
-
-
 import discord
 from discord.ext import commands
 import asyncio  # Make sure to import asyncio
@@ -33,7 +31,7 @@ async def setup(interaction: discord.Interaction):
             
             # Check if any user has an open ticket
             all_tickets = [channel for channel in guild.text_channels if channel.name.startswith('ticket-')]
-            if any(channel.name.startswith('ticket-') for channel in all_tickets):
+            if all_tickets:
                 await interaction.response.send_message("A ticket is already open. Please close it before creating a new one.", ephemeral=True)
                 return
             
@@ -83,6 +81,7 @@ async def close(interaction: discord.Interaction):
         await interaction.response.send_message('Ticket closed.', ephemeral=True)
     else:
         await interaction.response.send_message('This command can only be used in a ticket channel.', ephemeral=True)
+
 
 
 # Add your bot token here
