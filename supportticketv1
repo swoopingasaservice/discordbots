@@ -1,6 +1,9 @@
 import discord
 from discord.ext import commands
-import asyncio  # Make sure to import asyncio
+import asyncio
+
+# Explicitly define the channel ID where the button will be created
+TICKET_CHANNEL_ID = 1300179329891962967  # Replace with your actual channel ID
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -13,11 +16,9 @@ async def on_ready():
     await bot.tree.sync()  # Sync the commands with Discord
     print(f'Logged in as {bot.user}!')
 
-# Create a slash command to set up the ticket creation button
-@bot.tree.command(name="setup", description="Sets up the ticket creation button.")
-async def setup(interaction: discord.Interaction):
-    # Check if the user has the administrator permission
-    if interaction.user.guild_permissions.administrator:
+    # Automatically create the button in the specified channel on startup
+    channel = bot.get_channel(TICKET_CHANNEL_ID)
+    if channel:
         button = discord.ui.Button(label="Create Ticket", style=discord.ButtonStyle.primary)
 
         async def button_callback(interaction: discord.Interaction):
@@ -28,15 +29,6 @@ async def setup(interaction: discord.Interaction):
             if existing_ticket:
                 await interaction.response.send_message("You already have an open ticket. Please close it before creating a new one.", ephemeral=True)
                 return
-            
-            # Check if any user has an open ticket
-            all_tickets = [channel for channel in guild.text_channels if channel.name.startswith('ticket-')]
-            if all_tickets:
-                await interaction.response.send_message("A ticket is already open. Please close it before creating a new one.", ephemeral=True)
-                return
-            
-            # Get the category of the channel where the command was run
-            category = interaction.channel.category
             
             # Define permissions for the ticket channel
             overwrites = {
@@ -52,22 +44,120 @@ async def setup(interaction: discord.Interaction):
             # Create a unique ticket channel name using the server ID
             ticket_channel_name = f'ticket-{interaction.user.name}-{guild.id}'
             
-            # Check if the category is None and handle it
-            if category is None:
-                # Create the ticket channel without a category
-                ticket_channel = await guild.create_text_channel(ticket_channel_name, overwrites=overwrites)
-            else:
-                # Create the ticket channel in the same category with the defined permissions
-                ticket_channel = await guild.create_text_channel(ticket_channel_name, category=category, overwrites=overwrites)
+            # Get the category of the channel where the button was created
+            category = channel.category
+            
+            # Create the ticket channel in the same category
+            ticket_channel = await guild.create_text_channel(ticket_channel_name, category=category, overwrites=overwrites)
 
-            await ticket_channel.send(f'This is your support ticket, {interaction.user.mention}. Please describe your issue.')
+            # Create an embed for the ticket message
+            embed = discord.Embed(
+                title="New Support Ticket",
+                description=f'This is your support ticket, {interaction.user.mention}. Please describe your issue.',
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text="React with ❌ to close this ticket.")
+
+            ticket_message = await ticket_channel.send(embed=embed)
+
+            # Add a reaction for closing the ticket
+            await ticket_message.add_reaction("❌")
+
             await interaction.response.send_message(f'Ticket created: {ticket_channel.mention}', ephemeral=True)
+
+            # Define a check for the reaction
+            def check(reaction, user):
+                return user == interaction.user and str(reaction.emoji) == "❌" and reaction.message.id == ticket_message.id
+
+            # Wait for the user to react to close the ticket
+            try:
+                await bot.wait_for('reaction_add', timeout=86400.0, check=check)  # 24 hours timeout
+                await ticket_channel.send('This ticket will be closed in 5 seconds.')
+                await asyncio.sleep(5)
+                await ticket_channel.delete()
+            except asyncio.TimeoutError:
+                await ticket_channel.send('Ticket closed due to inactivity.')
 
         button.callback = button_callback
         view = discord.ui.View()
         view.add_item(button)
 
-        await interaction.response.send_message("Click the button below to create a support ticket:", view=view)
+        # Send the button message to the channel
+        await channel.send("Click the button below to create a support ticket:", view=view)
+
+@bot.tree.command(name="setup", description="Sets up the ticket creation button.")
+async def setup(interaction: discord.Interaction):
+    # Check if the user has the administrator permission
+    if interaction.user.guild_permissions.administrator:
+        channel = bot.get_channel(TICKET_CHANNEL_ID)
+        if channel:
+            button = discord.ui.Button(label="Create Ticket", style=discord.ButtonStyle.primary)
+
+            async def button_callback(interaction: discord.Interaction):
+                guild = interaction.guild
+                
+                # Check if the user already has an open ticket
+                existing_ticket = discord.utils.get(guild.text_channels, name=f'ticket-{interaction.user.name}-{guild.id}')
+                if existing_ticket:
+                    await interaction.response.send_message("You already have an open ticket. Please close it before creating a new one.", ephemeral=True)
+                    return
+                
+                # Define permissions for the ticket channel
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),  # Deny everyone
+                    interaction.user: discord.PermissionOverwrite(read_messages=True),  # Allow the user
+                }
+                
+                # Find the Admin role
+                admin_role = discord.utils.get(guild.roles, name="Admin")
+                if admin_role:
+                    overwrites[admin_role] = discord.PermissionOverwrite(read_messages=True)  # Allow Admins
+                
+                # Create a unique ticket channel name using the server ID
+                ticket_channel_name = f'ticket-{interaction.user.name}-{guild.id}'
+                
+                # Get the category of the channel where the button was created
+                category = channel.category
+                
+                # Create the ticket channel in the same category
+                ticket_channel = await guild.create_text_channel(ticket_channel_name, category=category, overwrites=overwrites)
+
+                # Create an embed for the ticket message
+                embed = discord.Embed(
+                    title="New Support Ticket",
+                    description=f'This is your support ticket, {interaction.user.mention}. Please describe your issue.',
+                    color=discord.Color.blue()
+                )
+                embed.set_footer(text="React with ❌ to close this ticket.")
+
+                ticket_message = await ticket_channel.send(embed=embed)
+
+                # Add a reaction for closing the ticket
+                await ticket_message.add_reaction("❌")
+
+                await interaction.response.send_message(f'Ticket created: {ticket_channel.mention}', ephemeral=True)
+
+                # Define a check for the reaction
+                def check(reaction, user):
+                    return user == interaction.user and str(reaction.emoji) == "❌" and reaction.message.id == ticket_message.id
+
+                # Wait for the user to react to close the ticket
+                try:
+                    await bot.wait_for('reaction_add', timeout=86400.0, check=check)  # 24 hours timeout
+                    await ticket_channel.send('This ticket will be closed in 5 seconds.')
+                    await asyncio.sleep(5)
+                    await ticket_channel.delete()
+                except asyncio.TimeoutError:
+                    await ticket_channel.send('Ticket closed due to inactivity.')
+
+            button.callback = button_callback
+            view = discord.ui.View()
+            view.add_item(button)
+
+            # Send the button message to the channel
+            await channel.send("Click the button below to create a support ticket:", view=view)
+        else:
+            await interaction.response.send_message("The specified channel does not exist.", ephemeral=True)
     else:
         await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
 
@@ -81,6 +171,8 @@ async def close(interaction: discord.Interaction):
         await interaction.response.send_message('Ticket closed.', ephemeral=True)
     else:
         await interaction.response.send_message('This command can only be used in a ticket channel.', ephemeral=True)
+
+
 
 
 
