@@ -1,4 +1,4 @@
-# sistersister/utilitybot.py
+
 
 import discord
 from discord.ext import commands
@@ -23,9 +23,22 @@ async def setup(interaction: discord.Interaction):
         button = discord.ui.Button(label="Create Ticket", style=discord.ButtonStyle.primary)
 
         async def button_callback(interaction: discord.Interaction):
+            guild = interaction.guild
+            
+            # Check if the user already has an open ticket
+            existing_ticket = discord.utils.get(guild.text_channels, name=f'ticket-{interaction.user.name}-{guild.id}')
+            if existing_ticket:
+                await interaction.response.send_message("You already have an open ticket. Please close it before creating a new one.", ephemeral=True)
+                return
+            
+            # Check if any user has an open ticket
+            all_tickets = [channel for channel in guild.text_channels if channel.name.startswith('ticket-')]
+            if any(channel.name.startswith('ticket-') for channel in all_tickets):
+                await interaction.response.send_message("A ticket is already open. Please close it before creating a new one.", ephemeral=True)
+                return
+            
             # Get the category of the channel where the command was run
             category = interaction.channel.category
-            guild = interaction.guild
             
             # Define permissions for the ticket channel
             overwrites = {
@@ -50,7 +63,7 @@ async def setup(interaction: discord.Interaction):
                 ticket_channel = await guild.create_text_channel(ticket_channel_name, category=category, overwrites=overwrites)
 
             await ticket_channel.send(f'This is your support ticket, {interaction.user.mention}. Please describe your issue.')
-            await interaction.response.send_message(f'Ticket created. Please look for a new text channel created with your username tagged: {ticket_channel.mention}', ephemeral=True)
+            await interaction.response.send_message(f'Ticket created: {ticket_channel.mention}', ephemeral=True)
 
         button.callback = button_callback
         view = discord.ui.View()
