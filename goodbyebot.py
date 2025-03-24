@@ -90,4 +90,4 @@ async def on_voice_state_update(member, before, after):
 
 
 # Run the bot with your token
-bot.run('MTMwNDg5MTY1Njk4MTQ0NjY1Ng.GuesCu.kG4gQyVdSpT6N5hRuLVTmDWYw1GCO4r1RJn_uI')
+bot.run('DiscordBotToken')
