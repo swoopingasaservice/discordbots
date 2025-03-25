@@ -1,0 +1,838 @@
+import os
+import re
+import time
+import json
+import logging
+import discord
+import asyncio
+from collections import defaultdict
+from datetime import datetime, timedelta
+from discord.ext import commands, tasks
+from discord.utils import escape_markdown
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))
+TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID"))
+BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+AUTHORIZED_USERS = [int(id) for id in os.getenv("AUTHORIZED_USERS", "").split(",") if id]
+AUTHORIZED_ROLES = [int(id) for id in os.getenv("AUTHORIZED_ROLES", "").split(",") if id]
+HISTORY_FILE = "moderation_history.json"
+
+# Rate limiting settings
+message_cooldowns = defaultdict(lambda: 0)
+message_counts = defaultdict(int)
+MAX_MESSAGES_PER_MINUTE = 5
+COOLDOWN_PERIOD = 60  # seconds
+
+# Set up logging
+logging.basicConfig(
+    filename='bot_activity.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Also log to console for debugging
+console = logging.StreamHandler()
+console.setLevel(logging.DEBUG)
+logging.getLogger('').addHandler(console)
+
+# Set up intents - Use only what's needed
+intents = discord.Intents.default()
+intents.message_content = True  # Needed to read message content
+intents.members = True          # Needed for member events
+intents.guilds = True           # Needed for guild access
+
+# Initialize bot
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Store the last checked audit log entry time
+last_audit_check = {}
+# Store processed audit log entries to avoid duplicates
+processed_audit_entries = set()
+# Store moderation history
+moderation_history = {}
+
+# Define important moderation action keywords to include
+IMPORTANT_MODERATION_KEYWORDS = [
+    "ban", "banned", "banning", "unbanned", "unban",
+    "kick", "kicked", "kicking",
+    "timeout", "timed out", "time out"
+]
+
+# Define keywords to exclude (lower priority actions)
+EXCLUDED_KEYWORDS = [
+    "mute", "muted", "muting", "unmuted", "unmute",
+    "joined voice channel", "left voice channel",
+    "moved to voice channel", "joined #", "left #",
+    "switched voice channel", "voice channel",
+    "message deleted", "message removed",
+    "edited message"
+]
+
+def load_moderation_history():
+    """Load moderation history from file"""
+    global moderation_history
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                moderation_history = json.load(f)
+                logging.info(f"Loaded moderation history for {len(moderation_history)} users")
+        else:
+            moderation_history = {}
+            logging.info("No moderation history file found, starting fresh")
+    except Exception as e:
+        logging.error(f"Error loading moderation history: {e}")
+        moderation_history = {}
+
+def save_moderation_history():
+    """Save moderation history to file"""
+    try:
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(moderation_history, f)
+        logging.debug("Saved moderation history")
+    except Exception as e:
+        logging.error(f"Error saving moderation history: {e}")
+
+def add_moderation_action(user_id, guild_id, action_type, reason=None, moderator=None, timestamp=None):
+    """Add a moderation action to a user's history"""
+    global moderation_history
+    
+    # Convert IDs to strings for JSON compatibility
+    user_id = str(user_id)
+    guild_id = str(guild_id)
+    
+    # Initialize user entry if not exists
+    if user_id not in moderation_history:
+        moderation_history[user_id] = []
+    
+    # Create the action entry
+    action = {
+        "guild_id": guild_id,
+        "action": action_type,
+        "timestamp": timestamp or datetime.utcnow().isoformat(),
+    }
+    
+    if reason:
+        action["reason"] = reason
+    
+    if moderator:
+        if isinstance(moderator, (discord.Member, discord.User)):
+            action["moderator"] = {
+                "id": str(moderator.id),
+                "name": moderator.name
+            }
+        else:
+            action["moderator"] = str(moderator)
+    
+    # Add to history
+    moderation_history[user_id].append(action)
+    
+    # Save to file
+    save_moderation_history()
+    logging.info(f"Added {action_type} action for user {user_id} in guild {guild_id}")
+
+def get_user_history(user_id):
+    """Get a user's moderation history"""
+    user_id = str(user_id)
+    return moderation_history.get(user_id, [])
+
+def format_history_embed(user, history):
+    """Format a user's moderation history as an embed"""
+    embed = discord.Embed(
+        title=f"Moderation History for {user.name}",
+        description=f"User ID: {user.id}",
+        color=discord.Color.blue(),
+        timestamp=datetime.utcnow()
+    )
+    
+    # Group actions by guild
+    guild_actions = defaultdict(list)
+    for action in history:
+        guild_id = action["guild_id"]
+        guild_actions[guild_id].append(action)
+    
+    # Add fields for each guild
+    for guild_id, actions in guild_actions.items():
+        # Try to get guild name
+        guild = bot.get_guild(int(guild_id))
+        guild_name = guild.name if guild else f"Unknown Guild ({guild_id})"
+        
+        # Format actions for this guild
+        action_text = ""
+        for action in actions:
+            timestamp = action.get("timestamp", "Unknown time")
+            if isinstance(timestamp, str):
+                try:
+                    # Convert ISO format to datetime
+                    dt = datetime.fromisoformat(timestamp)
+                    timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    pass
+            
+            action_text += f"• {action['action'].title()} - {timestamp}\n"
+            if "reason" in action:
+                action_text += f"  Reason: {action['reason']}\n"
+            if "moderator" in action:
+                if isinstance(action["moderator"], dict):
+                    action_text += f"  Moderator: {action['moderator']['name']}\n"
+                else:
+                    action_text += f"  Moderator: {action['moderator']}\n"
+        
+        embed.add_field(name=guild_name, value=action_text or "No details available", inline=False)
+    
+    return embed
+
+async def check_user_in_other_guilds(user, source_guild, action_type, reason, target_channel):
+    """Check if user is in other guilds and send history"""
+    other_guilds = []
+    for bot_guild in bot.guilds:
+        if bot_guild.id != source_guild.id:  # Skip the guild where the action happened
+            try:
+                # Try to fetch the member from this guild
+                member = await bot_guild.fetch_member(user.id)
+                if member:
+                    other_guilds.append(bot_guild)
+            except discord.NotFound:
+                # User is not in this guild
+                pass
+            except Exception as e:
+                logging.error(f"Error checking if user is in guild {bot_guild.name}: {e}")
+    
+    # If user is in other guilds, send an alert
+    if other_guilds:
+        guild_list = ", ".join([g.name for g in other_guilds])
+        alert_embed = discord.Embed(
+            title=f"⚠️ User {action_type.title()} Alert",
+            description=f"**{user.name}** (ID: {user.id}) was {action_type}ed from **{source_guild.name}** and is also present in these guilds: {guild_list}",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        
+        # Add reason if available
+        if reason:
+            alert_embed.add_field(name=f"{action_type.title()} Reason", value=reason)
+        
+        alert_embed.set_footer(text=f"Cross-guild {action_type} notification")
+        await target_channel.send(embed=alert_embed)
+        logging.info(f"Sent cross-guild alert for {action_type}ed user {user.name} in {len(other_guilds)} other guilds")
+        
+        # Get and send user's moderation history
+        history = get_user_history(user.id)
+        if history:
+            history_embed = format_history_embed(user, history)
+            await target_channel.send(embed=history_embed)
+            logging.info(f"Sent moderation history for {user.name}")
+def contains_links(content):
+    """Check if the message contains any URLs"""
+    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
+    return bool(re.search(url_pattern, content))
+
+def sanitize_content(content):
+    """Sanitize message content to prevent formatting exploits and pings"""
+    content = escape_markdown(content)
+    content = content.replace('@everyone', '@\u200beveryone').replace('@here', '@\u200bhere')
+    return content
+
+def remove_links(content):
+    """Remove all URLs from the message content"""
+    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
+    return re.sub(url_pattern, '[link removed]', content)
+
+def is_important_moderation_message(message):
+    """Check if a message is related to important moderation actions (ban, kick, timeout)"""
+    # First check if it contains any excluded keywords
+    content_lower = message.content.lower()
+    
+    # Check if it's a voice channel join/leave message
+    for keyword in EXCLUDED_KEYWORDS:
+        if keyword in content_lower:
+            return False
+    
+    # Check message content for important moderation keywords
+    if any(keyword in content_lower for keyword in IMPORTANT_MODERATION_KEYWORDS):
+        return True
+        
+    # Check embeds for important moderation keywords
+    for embed in message.embeds:
+        # Check embed title
+        if embed.title and any(keyword in embed.title.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+            return True
+            
+        # Check embed description
+        if embed.description and any(keyword in embed.description.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+            return True
+            
+        # Check embed fields
+        for field in embed.fields:
+            if any(keyword in field.name.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+                return True
+            if field.value and any(keyword in field.value.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+                return True
+    
+    # Check for specific colors commonly used in moderation embeds
+    for embed in message.embeds:
+        # Red is commonly used for moderation actions
+        if embed.color and embed.color.value in [0xED4245, 0xFF0000, 0xF04747]:  # Various red colors
+            # But make sure it's not excluded
+            if embed.description:
+                if any(keyword in embed.description.lower() for keyword in EXCLUDED_KEYWORDS):
+                    return False
+            return True
+    
+    # Check for specific message patterns from Discord's built-in moderation
+    if "has been banned from the server" in message.content:
+        return True
+    if "has been kicked from the server" in message.content:
+        return True
+    if "has been timed out" in message.content:
+        return True
+    
+    return False
+
+@bot.event
+async def on_ready():
+    """Event triggered when the bot is ready."""
+    print(f"Logged in as {bot.user.name} ({bot.user.id})")
+    print("Text-only log forwarding bot is now running!")
+    logging.info(f"Bot started: {bot.user.name} ({bot.user.id})")
+    
+    # Load moderation history
+    load_moderation_history()
+    
+    # Start the audit log checking task
+    check_audit_logs.start()
+
+@tasks.loop(seconds=10)  # Check more frequently
+async def check_audit_logs():
+    """Check audit logs periodically for moderation actions"""
+    global processed_audit_entries  # Add this line to use the global variable
+    
+    try:
+        # Get the source channel's guild
+        source_channel = bot.get_channel(SOURCE_CHANNEL_ID)
+        if not source_channel:
+            logging.warning(f"Source channel {SOURCE_CHANNEL_ID} not found")
+            return
+            
+        guild = source_channel.guild
+        logging.debug(f"Checking audit logs for guild: {guild.name}")
+        
+        # Get the target channel
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            logging.warning(f"Target channel {TARGET_CHANNEL_ID} not found")
+            return
+            
+        # Initialize last check time for this guild if not exists
+        if guild.id not in last_audit_check:
+            # Use timezone-naive datetime
+            last_audit_check[guild.id] = datetime.utcnow().replace(tzinfo=None) - timedelta(minutes=5)
+            logging.debug(f"Initialized audit log check time for {guild.name}")
+            
+        # Get audit log entries - check more entries to ensure we don't miss any
+        try:
+            async for entry in guild.audit_logs(limit=25):
+                # Create a unique ID for this entry to avoid duplicates
+                entry_id = f"{entry.id}-{entry.action}-{entry.created_at}"
+                
+                # Skip if we've already processed this entry
+                if entry_id in processed_audit_entries:
+                    continue
+                    
+                # Add to processed entries
+                processed_audit_entries.add(entry_id)
+                
+                # Convert entry created_at to naive datetime for comparison
+                entry_created_at = entry.created_at
+                if entry_created_at.tzinfo:
+                    entry_created_at = entry_created_at.replace(tzinfo=None)
+                
+                # Update the last check time
+                if entry_created_at > last_audit_check[guild.id]:
+                    last_audit_check[guild.id] = entry_created_at
+                
+                # Check if this is a moderation action we care about
+                if entry.action == discord.AuditLogAction.ban:
+                    # This is a ban
+                    logging.info(f"Ban detected for {entry.target} in {guild.name}")
+                    
+                    # Create an embed for the ban
+                    embed = discord.Embed(
+                        title="Member Banned",
+                        description=f"{entry.target} has been banned from {guild.name}",
+                        color=discord.Color.red(),
+                        timestamp=entry.created_at
+                    )
+                    
+                    embed.add_field(name="Moderator", value=f"{entry.user}", inline=True)
+                    
+                    if entry.reason:
+                        embed.add_field(name="Reason", value=entry.reason, inline=False)
+                    
+                    embed.set_footer(text=f"From {guild.name}")
+                    
+                    # Send the embed to the target channel
+                    await target_channel.send(embed=embed)
+                    logging.info(f"Forwarded ban event for {entry.target}")
+                    
+                    # Add to moderation history
+                    add_moderation_action(
+                        entry.target.id, 
+                        guild.id, 
+                        "ban", 
+                        reason=entry.reason, 
+                        moderator=entry.user,
+                        timestamp=entry.created_at.isoformat()
+                    )
+                    
+                    # Check if user is in other guilds and send history
+                    await check_user_in_other_guilds(
+                        entry.target, 
+                        guild, 
+                        "ban", 
+                        entry.reason, 
+                        target_channel
+                    )
+                    
+                elif entry.action == discord.AuditLogAction.kick:
+                    # This is a kick
+                    logging.info(f"Kick detected for {entry.target} in {guild.name}")
+                    
+                    # Create an embed for the kick
+                    embed = discord.Embed(
+                        title="Member Kicked",
+                        description=f"{entry.target} has been kicked from {guild.name}",
+                        color=discord.Color.orange(),
+                        timestamp=entry.created_at
+                    )
+                    
+                    embed.add_field(name="Moderator", value=f"{entry.user}", inline=True)
+                    
+                    if entry.reason:
+                        embed.add_field(name="Reason", value=entry.reason, inline=False)
+                    
+                    embed.set_footer(text=f"From {guild.name}")
+                    
+                    # Send the embed to the target channel
+                    await target_channel.send(embed=embed)
+                    logging.info(f"Forwarded kick event for {entry.target}")
+                    
+                    # Add to moderation history
+                    add_moderation_action(
+                        entry.target.id, 
+                        guild.id, 
+                        "kick", 
+                        reason=entry.reason, 
+                        moderator=entry.user,
+                        timestamp=entry.created_at.isoformat()
+                    )
+                    
+                    # Check if user is in other guilds and send history
+                    await check_user_in_other_guilds(
+                        entry.target, 
+                        guild, 
+                        "kick", 
+                        entry.reason, 
+                        target_channel
+                    )
+                    
+                elif entry.action == discord.AuditLogAction.member_update:
+                    # Check if this is a timeout
+                    if hasattr(entry, 'before') and hasattr(entry, 'after'):
+                        if hasattr(entry.before, 'timed_out_until') and hasattr(entry.after, 'timed_out_until'):
+                            if not entry.before.timed_out_until and entry.after.timed_out_until:
+                                # This is a timeout
+                                logging.info(f"Timeout detected for {entry.target} in {guild.name}")
+                                
+                                # Calculate timeout duration
+                                timeout_until = entry.after.timed_out_until
+                                if timeout_until:
+                                    now = datetime.utcnow()
+                                    if timeout_until.tzinfo:
+                                        now = now.replace(tzinfo=timeout_until.tzinfo)
+                                    duration = timeout_until - now
+                                    duration_str = f"{duration.days}d {duration.seconds//3600}h {(duration.seconds//60)%60}m"
+                                else:
+                                    duration_str = "Unknown"
+                                
+                                # Create an embed for the timeout
+                                embed = discord.Embed(
+                                    title="Member Timed Out",
+                                    description=f"{entry.target} has been timed out in {guild.name}",
+                                    color=discord.Color.gold(),
+                                    timestamp=entry.created_at
+                                )
+                                
+                                embed.add_field(name="Moderator", value=f"{entry.user}", inline=True)
+                                embed.add_field(name="Duration", value=duration_str, inline=True)
+                                
+                                if entry.reason:
+                                    embed.add_field(name="Reason", value=entry.reason, inline=False)
+                                
+                                embed.set_footer(text=f"From {guild.name}")
+                                
+                                # Send the embed to the target channel
+                                await target_channel.send(embed=embed)
+                                logging.info(f"Forwarded timeout event for {entry.target}")
+                                
+                                # Add to moderation history
+                                add_moderation_action(
+                                    entry.target.id, 
+                                    guild.id, 
+                                    "timeout", 
+                                    reason=entry.reason, 
+                                    moderator=entry.user,
+                                    timestamp=entry.created_at.isoformat()
+                                )
+                                
+                                # Check if user is in other guilds and send history
+                                await check_user_in_other_guilds(
+                                    entry.target, 
+                                    guild, 
+                                    "timeout", 
+                                    entry.reason, 
+                                    target_channel
+                                )
+            
+            # Limit the size of processed_audit_entries to prevent memory issues
+            if len(processed_audit_entries) > 1000:
+                processed_audit_entries_list = list(processed_audit_entries)
+                processed_audit_entries = set(processed_audit_entries_list[-500:])  # Keep the most recent 500
+                logging.debug("Pruned processed_audit_entries to prevent memory issues")
+                
+        except discord.Forbidden:
+            logging.error(f"No permission to view audit logs in {guild.name}")
+        except Exception as e:
+            logging.error(f"Error checking audit logs: {e}")
+            
+    except Exception as e:
+        logging.error(f"Error in check_audit_logs task: {e}")
+
+@bot.event
+async def on_member_ban(guild, user):
+    """Event triggered when a member is banned"""
+    try:
+        # Only process if it's from our source guild
+        source_channel = bot.get_channel(SOURCE_CHANNEL_ID)
+        if not source_channel or guild.id != source_channel.guild.id:
+            return
+            
+        # Get the target channel
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            return
+            
+        logging.info(f"Ban event detected for {user.name} in {guild.name}")
+        
+        # Try to get ban reason and moderator from audit logs
+        reason = None
+        moderator = None
+        
+        try:
+            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
+                if entry.target.id == user.id and (datetime.utcnow() - entry.created_at.replace(tzinfo=None)).total_seconds() < 10:
+                    reason = entry.reason
+                    moderator = entry.user
+                    break
+        except:
+            pass
+        
+        # Create an embed for the ban
+        embed = discord.Embed(
+            title="Member Banned",
+            description=f"{user.mention} ({user.name}) has been banned from {guild.name}",
+            color=discord.Color.red(),
+            timestamp=datetime.utcnow()
+        )
+        
+        if moderator:
+            embed.add_field(name="Moderator", value=f"{moderator}", inline=True)
+        
+        if reason:
+            embed.add_field(name="Reason", value=reason, inline=False)
+        
+        embed.set_footer(text=f"From {guild.name}")
+        
+        # Send the embed to the target channel
+        await target_channel.send(embed=embed)
+        logging.info(f"Forwarded ban event for {user.name}")
+        
+        # Add to moderation history
+        add_moderation_action(user.id, guild.id, "ban", reason=reason, moderator=moderator)
+        
+        # Check if user is in other guilds and send history
+        await check_user_in_other_guilds(user, guild, "ban", reason, target_channel)
+    
+    except Exception as e:
+        logging.error(f"Error handling ban event: {e}")
+
+@bot.event
+async def on_member_remove(member):
+    """Event triggered when a member leaves or is kicked"""
+    try:
+        # Only process if it's from our source guild
+        source_channel = bot.get_channel(SOURCE_CHANNEL_ID)
+        if not source_channel or member.guild.id != source_channel.guild.id:
+            return
+            
+        # Get the target channel
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            return
+            
+        # Wait a moment to allow the audit log to update
+        await asyncio.sleep(2)
+        
+        # Check if this was a kick by looking at recent audit logs
+        try:
+            was_kicked = False
+            kick_entry = None
+            
+            async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
+                if entry.target.id == member.id and (datetime.utcnow() - entry.created_at.replace(tzinfo=None)).total_seconds() < 10:
+                    # This was a kick
+                    was_kicked = True
+                    kick_entry = entry
+                    logging.info(f"Kick detected for {member.name} in {member.guild.name}")
+                    
+                    # Create an embed for the kick
+                    embed = discord.Embed(
+                        title="Member Kicked",
+                        description=f"{member.mention} ({member.name}) has been kicked from {member.guild.name}",
+                        color=discord.Color.orange(),
+                        timestamp=entry.created_at
+                    )
+                    
+                    embed.add_field(name="Moderator", value=f"{entry.user}", inline=True)
+                    
+                    if entry.reason:
+                        embed.add_field(name="Reason", value=entry.reason, inline=False)
+                    
+                    embed.set_footer(text=f"From {member.guild.name}")
+                    
+                    # Send the embed to the target channel
+                    await target_channel.send(embed=embed)
+                    logging.info(f"Forwarded kick event for {member.name}")
+                    
+                    # Add to moderation history
+                    add_moderation_action(
+                        member.id, 
+                        member.guild.id, 
+                        "kick", 
+                        reason=entry.reason, 
+                        moderator=entry.user,
+                        timestamp=entry.created_at.isoformat()
+                    )
+                    break  # Exit after finding the kick
+            
+            # If the user was kicked, check if they're in other guilds
+            if was_kicked:
+                await check_user_in_other_guilds(
+                    member, 
+                    member.guild, 
+                    "kick", 
+                    reason=kick_entry.reason if kick_entry else None,
+                    target_channel=target_channel
+                )
+        
+        except discord.Forbidden:
+            logging.error(f"No permission to view audit logs in {member.guild.name}")
+        except Exception as e:
+            logging.error(f"Error checking if member was kicked: {e}")
+    
+    except Exception as e:
+        logging.error(f"Error handling member remove event: {e}")
+
+@bot.event
+async def on_message(message):
+    """Event triggered when a message is sent in any channel the bot can see."""
+    # Ignore messages from the bot itself to prevent loops
+    if message.author == bot.user:
+        return
+    
+    # Check if the message is from the source channel
+    if message.channel.id == SOURCE_CHANNEL_ID:
+        try:
+            # Check if this is a bot message
+            is_bot_message = message.author.bot
+            
+            # For bot messages, only forward if they're important moderation-related
+            if is_bot_message:
+                # Skip if not an important moderation message
+                if not is_important_moderation_message(message):
+                    return
+                
+                logging.info(f"Processing important moderation message from {message.author.name}")
+                
+                # Try to extract user information from the message for history tracking
+                # This is complex and depends on the format of moderation messages from different bots
+                # Here's a simple example for common formats
+                user_id = None
+                action_type = None
+                reason = None
+                
+                # Check content for user mentions and action type
+                if message.mentions:
+                    mentioned_user = message.mentions[0]
+                    user_id = mentioned_user.id
+                    
+                    content_lower = message.content.lower()
+                    if "ban" in content_lower:
+                        action_type = "ban"
+                    elif "kick" in content_lower:
+                        action_type = "kick"
+                    elif "timeout" in content_lower or "timed out" in content_lower:
+                        action_type = "timeout"
+                    
+                    # Try to extract reason
+                    reason_match = re.search(r"reason:?\s*(.+?)(?:\.|$)", message.content, re.IGNORECASE)
+                    if reason_match:
+                        reason = reason_match.group(1).strip()
+                
+                # If we identified a moderation action, add it to history
+                if user_id and action_type:
+                    add_moderation_action(
+                        user_id,
+                        message.guild.id,
+                        action_type,
+                        reason=reason,
+                        moderator=message.author
+                    )
+                    logging.info(f"Added {action_type} action from bot message for user {user_id}")
+            else:
+                # Regular user authorization check
+                user_authorized = (message.author.id in AUTHORIZED_USERS or 
+                                any(role.id in AUTHORIZED_ROLES for role in message.author.roles if hasattr(message.author, 'roles')))
+                
+                if not user_authorized and AUTHORIZED_USERS:  # Skip check if no authorized users defined
+                    logging.warning(f"Unauthorized message from {message.author.name} ignored")
+                    return
+                
+                # Apply rate limiting
+                current_time = time.time()
+                user_id = message.author.id
+                
+                if current_time - message_cooldowns[user_id] < COOLDOWN_PERIOD:
+                    message_counts[user_id] += 1
+                    if message_counts[user_id] > MAX_MESSAGES_PER_MINUTE:
+                        logging.warning(f"Rate limit exceeded for {message.author.name}")
+                        return
+                else:
+                    message_counts[user_id] = 1
+                    
+                message_cooldowns[user_id] = current_time
+            
+            # Skip empty messages unless they have embeds
+            if not message.content.strip() and not message.embeds:
+                return
+                
+            # Get the target channel
+            target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+            
+            if not target_channel:
+                logging.error(f"Target channel {TARGET_CHANNEL_ID} not found")
+                return
+            
+            # Special handling for bot messages
+            if is_bot_message:
+                # Forward the message content if it exists
+                if message.content.strip():
+                    bot_message = f"**Moderation Action from {message.author.name} in {message.guild.name}**\n{message.content}"
+                    await target_channel.send(bot_message)
+                
+                # Forward all embeds from the bot
+                if message.embeds:
+                    logging.info(f"Forwarding {len(message.embeds)} moderation embeds from {message.author.name}")
+                    for embed in message.embeds:
+                        try:
+                            # Create a copy of the embed to ensure it's forwarded correctly
+                            new_embed = discord.Embed.from_dict(embed.to_dict())
+                            
+                            # Add source information to the embed footer
+                            if new_embed.footer.text:
+                                new_embed.set_footer(text=f"{new_embed.footer.text} | From {message.guild.name}", 
+                                                   icon_url=new_embed.footer.icon_url)
+                            else:
+                                new_embed.set_footer(text=f"From {message.guild.name}")
+                            
+                            await target_channel.send(embed=new_embed)
+                            logging.info(f"Successfully forwarded moderation embed from {message.author.name}")
+                        except Exception as e:
+                            logging.error(f"Error forwarding embed: {e}")
+                            # Try sending as plain text if embed fails
+                            try:
+                                embed_dict = embed.to_dict()
+                                embed_text = f"**Moderation Embed from {message.author.name}**\n"
+                                
+                                if 'title' in embed_dict:
+                                    embed_text += f"**Title:** {embed_dict['title']}\n"
+                                if 'description' in embed_dict:
+                                    embed_text += f"**Description:** {embed_dict['description']}\n"
+                                if 'fields' in embed_dict:
+                                    for field in embed_dict['fields']:
+                                        embed_text += f"**{field['name']}:** {field['value']}\n"
+                                
+                                await target_channel.send(embed_text)
+                                logging.info(f"Forwarded moderation embed as text from {message.author.name}")
+                            except Exception as e2:
+                                logging.error(f"Error forwarding embed as text: {e2}")
+            else:
+                # Regular user message processing
+                processed_content = message.content
+                
+                # Check for and remove links
+                has_links = contains_links(processed_content)
+                if has_links:
+                    processed_content = remove_links(processed_content)
+                    logging.info(f"Links removed from message by {message.author.name}")
+                
+                # Sanitize the message content
+                safe_content = sanitize_content(processed_content)
+                
+                # Create the forwarded message with full attribution
+                forwarded_content = (
+                    f"**Message from {message.guild.name}**\n"
+                    f"**User:** {message.author.name}\n"
+                    f"**Channel:** #{message.channel.name}\n"
+                    f"**Content:** {safe_content}"
+                )
+                
+                # Note if attachments were blocked
+                if message.attachments:
+                    forwarded_content += f"\n\n**Note:** {len(message.attachments)} attachment(s) were not forwarded."
+                
+                # Send the text-only message to the target channel
+                await target_channel.send(forwarded_content)
+                
+                # Forward embeds if present
+                if message.embeds:
+                    for embed in message.embeds:
+                        try:
+                            await target_channel.send(embed=embed)
+                        except Exception as e:
+                            logging.error(f"Error forwarding embed: {e}")
+            
+            # Log the successful forward
+            logging.info(
+                f"FORWARD: {message.author.id} ({message.author.name}) "
+                f"from {message.guild.id} ({message.guild.name}) - Content length: {len(message.content)}"
+            )
+            
+        except Exception as e:
+            logging.error(f"Error forwarding message: {e}")
+    
+    # Process commands if any
+    await bot.process_commands(message)
+
+# Run the bot
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        print("Error: No Discord token found. Please set DISCORD_TOKEN in .env file.")
+        logging.critical("No Discord token found. Bot startup failed.")
+    else:
+        print("Starting bot...")
+        bot.run(BOT_TOKEN)
