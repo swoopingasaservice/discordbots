@@ -1,0 +1,1598 @@
+import os
+import re
+import time
+import json
+import logging
+import discord
+import asyncio
+from collections import defaultdict, deque, Counter
+from datetime import datetime, timedelta
+from discord.ext import commands, tasks
+from discord.utils import escape_markdown
+from dotenv import load_dotenv
+from logging.handlers import RotatingFileHandler
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))
+TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID"))
+BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+AUTHORIZED_USERS = [int(id) for id in os.getenv("AUTHORIZED_USERS", "").split(",") if id]
+AUTHORIZED_ROLES = [int(id) for id in os.getenv("AUTHORIZED_ROLES", "").split(",") if id]
+HISTORY_FILE = os.getenv("HISTORY_FILE", "moderation_history.json")
+LOG_FILE = os.getenv("LOG_FILE", "bot_activity.log")
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+# Rate limiting settings
+message_cooldowns = defaultdict(lambda: 0)
+message_counts = defaultdict(int)
+MAX_MESSAGES_PER_MINUTE = int(os.getenv("MAX_MESSAGES_PER_MINUTE", "5"))
+COOLDOWN_PERIOD = int(os.getenv("COOLDOWN_PERIOD", "60"))  # seconds
+
+# Audit log check settings
+AUDIT_CHECK_INTERVAL = int(os.getenv("AUDIT_CHECK_INTERVAL", "10"))  # seconds
+AUDIT_LOG_LIMIT = int(os.getenv("AUDIT_LOG_LIMIT", "100"))  # entries to check
+
+# Reputation scoring weights
+BAN_WEIGHT = int(os.getenv("BAN_WEIGHT", "10"))
+KICK_WEIGHT = int(os.getenv("KICK_WEIGHT", "5"))
+TIMEOUT_WEIGHT = int(os.getenv("TIMEOUT_WEIGHT", "3"))
+
+# Set up logging with rotation
+log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
+log_handler = RotatingFileHandler(
+    LOG_FILE, 
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+logging.basicConfig(
+    level=log_level,
+    handlers=[log_handler]
+)
+
+# Also log to console for debugging
+if DEBUG_MODE:
+    console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG)
+    console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logging.getLogger('').addHandler(console)
+
+# Set up intents - Use only what's needed
+intents = discord.Intents.default()
+intents.message_content = True  # Needed to read message content
+intents.members = True          # Needed for member events
+intents.guilds = True           # Needed for guild access
+
+# Initialize bot
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Store the last checked audit log entry time
+last_audit_check = {}
+# Store processed audit log entries to avoid duplicates (using deque for better memory management)
+processed_audit_entries = deque(maxlen=10000)
+# Store processed moderation actions to avoid duplicates (using deque for better memory management)
+processed_actions = deque(maxlen=10000)
+# Store moderation history
+moderation_history = {}
+
+# Define important moderation action keywords to include
+IMPORTANT_MODERATION_KEYWORDS = [
+    "ban", "banned", "banning", "unbanned", "unban",
+    "kick", "kicked", "kicking",
+    "timeout", "timed out", "time out"
+]
+
+# Define keywords to exclude (lower priority actions)
+EXCLUDED_KEYWORDS = [
+    "mute", "muted", "muting", "unmuted", "unmute",
+    "joined voice channel", "left voice channel",
+    "moved to voice channel", "joined #", "left #",
+    "switched voice channel", "voice channel",
+    "message deleted", "message removed",
+    "edited message"
+]
+def format_timestamp(dt):
+    """Format a datetime object to a standard string format"""
+    if dt.tzinfo:
+        dt = dt.replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def load_moderation_history():
+    """Load moderation history from file"""
+    global moderation_history
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                moderation_history = json.load(f)
+                logging.info(f"Loaded moderation history for {len(moderation_history)} users")
+        else:
+            moderation_history = {}
+            logging.info("No moderation history file found, starting fresh")
+    except Exception as e:
+        logging.error(f"Error loading moderation history: {e}")
+        moderation_history = {}
+
+def save_moderation_history():
+    """Save moderation history to file"""
+    try:
+        # Create a backup of the current file if it exists
+        if os.path.exists(HISTORY_FILE):
+            backup_file = f"{HISTORY_FILE}.bak"
+            try:
+                with open(HISTORY_FILE, 'r') as src, open(backup_file, 'w') as dst:
+                    dst.write(src.read())
+                logging.debug(f"Created backup of moderation history at {backup_file}")
+            except Exception as e:
+                logging.error(f"Failed to create backup of moderation history: {e}")
+        
+        # Save the current history
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(moderation_history, f)
+        logging.debug("Saved moderation history")
+    except Exception as e:
+        logging.error(f"Error saving moderation history: {e}")
+
+def add_moderation_action(user_id, guild_id, action_type, reason=None, moderator=None, timestamp=None):
+    """Add a moderation action to a user's history"""
+    global moderation_history
+    
+    # Convert IDs to strings for JSON compatibility
+    user_id = str(user_id)
+    guild_id = str(guild_id)
+    
+    # Create a unique action ID to avoid duplicates
+    action_id = f"{action_type}-{user_id}-{guild_id}-{timestamp or datetime.utcnow().isoformat()}"
+    
+    # Skip if we've already processed this action
+    if action_id in processed_actions:
+        return
+        
+    # Add to processed actions
+    processed_actions.append(action_id)
+    
+    # Initialize user entry if not exists
+    if user_id not in moderation_history:
+        moderation_history[user_id] = []
+    
+    # Get guild owner information
+    guild = bot.get_guild(int(guild_id))
+    guild_owner = None
+    if guild and guild.owner:
+        guild_owner = {
+            "id": str(guild.owner.id),
+            "name": guild.owner.name
+        }
+    
+    # Create the action entry
+    action = {
+        "guild_id": guild_id,
+        "action": action_type,
+        "timestamp": timestamp or datetime.utcnow().isoformat(),
+    }
+    
+    if reason:
+        action["reason"] = reason
+    
+    if moderator:
+        if isinstance(moderator, (discord.Member, discord.User)):
+            action["moderator"] = {
+                "id": str(moderator.id),
+                "name": moderator.name
+            }
+        else:
+            action["moderator"] = str(moderator)
+    
+    if guild_owner:
+        action["guild_owner"] = guild_owner
+    
+    # Add to history
+    moderation_history[user_id].append(action)
+    
+    # Save to file
+    save_moderation_history()
+    logging.info(f"Added {action_type} action for user {user_id} in guild {guild_id}")
+
+def get_user_history(user_id):
+    """Get a user's moderation history"""
+    user_id = str(user_id)
+    return moderation_history.get(user_id, [])
+
+def calculate_reputation_score(user_id):
+    """Calculate a reputation score based on moderation actions"""
+    user_id = str(user_id)
+    history = get_user_history(user_id)
+    
+    if not history:
+        return 100  # Perfect score for users with no history
+    
+    # Count different types of actions
+    action_counts = Counter(action["action"] for action in history)
+    
+    # Calculate weighted score
+    ban_count = action_counts.get("ban", 0)
+    kick_count = action_counts.get("kick", 0)
+    timeout_count = action_counts.get("timeout", 0)
+    
+    # Calculate penalty (higher is worse)
+    penalty = (ban_count * BAN_WEIGHT) + (kick_count * KICK_WEIGHT) + (timeout_count * TIMEOUT_WEIGHT)
+    
+    # Calculate score (100 is perfect, lower is worse)
+    score = max(0, 100 - penalty)
+    
+    return score
+
+def get_user_roles_in_guilds(user_id):
+    """Get a user's roles in all guilds the bot is in"""
+    user_roles = {}
+    
+    for guild in bot.guilds:
+        try:
+            member = guild.get_member(user_id)
+            if member:
+                # Get the member's roles
+                roles = [role.name for role in member.roles if role.name != "@everyone"]
+                user_roles[guild.name] = {
+                    "guild_id": str(guild.id),
+                    "roles": roles,
+                    "joined_at": member.joined_at.isoformat() if member.joined_at else None,
+                    "nickname": member.nick
+                }
+        except Exception as e:
+            logging.error(f"Error getting roles for user {user_id} in guild {guild.name}: {e}")
+    
+    return user_roles
+
+def get_leaderboard(limit=10):
+    """Get users with the most moderation actions against them"""
+    # Count actions for each user
+    user_counts = {}
+    for user_id, actions in moderation_history.items():
+        # Count total actions
+        user_counts[user_id] = len(actions)
+    
+    # Sort by count (descending)
+    sorted_users = sorted(user_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    # Take top N
+    top_users = sorted_users[:limit]
+    
+    return top_users
+def format_history_embed(user, history, page=0, items_per_page=5):
+    """Format a user's moderation history as an embed with pagination"""
+    embed = discord.Embed(
+        title=f"Moderation History for {user.name}",
+        description=f"User ID: {user.id}",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
+    )
+    
+    # Group actions by guild
+    guild_actions = defaultdict(list)
+    for action in history:
+        guild_id = action["guild_id"]
+        guild_actions[guild_id].append(action)
+    
+    # Sort guilds by most recent action
+    sorted_guilds = sorted(
+        guild_actions.items(),
+        key=lambda x: max([datetime.fromisoformat(a["timestamp"]) if isinstance(a["timestamp"], str) else a["timestamp"] for a in x[1]]),
+        reverse=True
+    )
+    
+    # Calculate pagination
+    total_guilds = len(sorted_guilds)
+    total_pages = max(1, (total_guilds + items_per_page - 1) // items_per_page)
+    page = max(0, min(page, total_pages - 1))  # Ensure page is in valid range
+    
+    # Get the guilds for this page
+    start_idx = page * items_per_page
+    end_idx = min(start_idx + items_per_page, total_guilds)
+    page_guilds = sorted_guilds[start_idx:end_idx]
+    
+    # Add pagination info with navigation arrows
+    nav_text = f"Page {page+1}/{total_pages}"
+    if total_pages > 1:
+        if page > 0:
+            nav_text = f"◀️ {nav_text}"
+        if page < total_pages - 1:
+            nav_text = f"{nav_text} ▶️"
+    
+    embed.set_footer(text=f"{nav_text} • Today at {format_timestamp(datetime.utcnow())}")
+    
+    # If no guilds on this page
+    if not page_guilds:
+        embed.add_field(name="No History", value="No moderation history found for this page", inline=False)
+        return embed
+    
+    # Add fields for each guild on this page
+    for guild_id, actions in page_guilds:
+        # Try to get guild name
+        guild = bot.get_guild(int(guild_id))
+        guild_name = guild.name if guild else f"Unknown Guild ({guild_id})"
+        
+        # Format actions for this guild
+        action_text = ""
+        guild_owner_info = None
+        
+        # Sort actions by timestamp (newest first)
+        sorted_actions = sorted(
+            actions,
+            key=lambda a: datetime.fromisoformat(a["timestamp"]) if isinstance(a["timestamp"], str) else a["timestamp"],
+            reverse=True
+        )
+        
+        # Remove duplicate actions (same action type, same timestamp)
+        unique_actions = []
+        seen_actions = set()
+        
+        for action in sorted_actions:
+            # Create a unique identifier for this action
+            timestamp = action.get("timestamp", "Unknown time")
+            action_type = action.get("action", "Unknown")
+            
+            # Create a unique key for deduplication
+            action_key = f"{action_type}-{timestamp}"
+            
+            if action_key not in seen_actions:
+                seen_actions.add(action_key)
+                unique_actions.append(action)
+        
+        for action in unique_actions:
+            # Check if adding this action would exceed Discord's field value limit
+            new_action_text = ""
+            timestamp = action.get("timestamp", "Unknown time")
+            if isinstance(timestamp, str):
+                try:
+                    # Convert ISO format to datetime
+                    dt = datetime.fromisoformat(timestamp)
+                    timestamp = format_timestamp(dt)
+                except:
+                    pass
+            
+            new_action_text += f"• {action['action'].title()} - {timestamp}\n"
+            if "reason" in action:
+                new_action_text += f"  Reason: {action['reason']}\n"
+            if "moderator" in action:
+                if isinstance(action["moderator"], dict):
+                    new_action_text += f"  Moderator: {action['moderator']['name']}\n"
+                else:
+                    new_action_text += f"  Moderator: {action['moderator']}\n"
+            
+            # Check if adding this would exceed Discord's limit (1024 characters)
+            if len(action_text + new_action_text) > 1000:  # Leave a little buffer
+                # If we would exceed the limit, add a note and stop adding more
+                action_text += "...(more history available but not shown)..."
+                break
+                
+            # Otherwise, add this action to the text
+            action_text += new_action_text
+            
+            # Store guild owner info if available
+            if "guild_owner" in action and not guild_owner_info:
+                guild_owner_info = action["guild_owner"]
+        
+        # Ensure the field value doesn't exceed Discord's limit
+        if len(action_text) > 1024:
+            action_text = action_text[:1000] + "...(truncated)"
+            
+        embed.add_field(name=guild_name, value=action_text or "No details available", inline=False)
+        
+        # Add contact information for the guild owner
+        if guild_owner_info:
+            contact_text = f"Server Owner: {guild_owner_info['name']} (ID: {guild_owner_info['id']})"
+            # Ensure contact info doesn't exceed limit
+            if len(contact_text) > 1024:
+                contact_text = contact_text[:1021] + "..."
+                
+            embed.add_field(
+                name=f"Contact for {guild_name}",
+                value=contact_text,
+                inline=False
+            )
+    
+    return embed
+
+def format_profile_embed(user, roles_in_guilds):
+    """Format a user's profile information as an embed"""
+    embed = discord.Embed(
+        title=f"Profile for {user.name}",
+        description=f"User ID: {user.id}",
+        color=discord.Color.blue(),
+        timestamp=datetime.utcnow()
+    )
+    
+    # Add user creation date
+    embed.add_field(
+        name="Account Created",
+        value=format_timestamp(user.created_at),
+        inline=True
+    )
+    
+    # Add reputation score
+    rep_score = calculate_reputation_score(user.id)
+    embed.add_field(
+        name="Reputation Score",
+        value=f"{rep_score}/100",
+        inline=True
+    )
+    
+    # Add number of servers
+    embed.add_field(
+        name="Shared Servers",
+        value=f"{len(roles_in_guilds)} servers",
+        inline=True
+    )
+    
+    # Add server-specific information
+    for guild_name, guild_info in roles_in_guilds.items():
+        # Format roles
+        roles_text = ", ".join(guild_info["roles"]) if guild_info["roles"] else "No roles"
+        
+        # Format joined date
+        joined_at = "Unknown"
+        if guild_info["joined_at"]:
+            try:
+                joined_dt = datetime.fromisoformat(guild_info["joined_at"])
+                joined_at = format_timestamp(joined_dt)
+            except:
+                joined_at = guild_info["joined_at"]
+        
+        # Create field value
+        field_value = f"Joined: {joined_at}\n"
+        if guild_info["nickname"]:
+            field_value += f"Nickname: {guild_info['nickname']}\n"
+        field_value += f"Roles: {roles_text}"
+        
+        # Ensure field value doesn't exceed Discord's limit
+        if len(field_value) > 1024:
+            field_value = field_value[:1021] + "..."
+        
+        embed.add_field(
+            name=guild_name,
+            value=field_value,
+            inline=False
+        )
+    
+    return embed
+
+def format_reputation_embed(user, score, history):
+    """Format a user's reputation information as an embed"""
+    embed = discord.Embed(
+        title=f"Reputation for {user.name}",
+        description=f"User ID: {user.id}",
+        color=discord.Color.gold(),
+        timestamp=datetime.utcnow()
+    )
+    
+    # Add reputation score
+    embed.add_field(
+        name="Reputation Score",
+        value=f"{score}/100",
+        inline=True
+    )
+    
+    # Count different types of actions
+    action_counts = Counter(action["action"] for action in history)
+    
+    # Add action counts
+    embed.add_field(
+        name="Total Actions",
+        value=f"{len(history)} moderation actions",
+        inline=True
+    )
+    
+    # Add breakdown of actions
+    breakdown = []
+    for action_type, count in action_counts.items():
+        breakdown.append(f"{action_type.title()}: {count}")
+    
+    embed.add_field(
+        name="Breakdown",
+        value="\n".join(breakdown) if breakdown else "No actions",
+        inline=False
+    )
+    
+    # Add most recent actions (up to 5)
+    if history:
+        # Sort by timestamp (newest first)
+        sorted_history = sorted(
+            history,
+            key=lambda a: datetime.fromisoformat(a["timestamp"]) if isinstance(a["timestamp"], str) else a["timestamp"],
+            reverse=True
+        )
+        
+        recent_text = ""
+        for i, action in enumerate(sorted_history[:5]):
+            timestamp = action.get("timestamp", "Unknown time")
+            if isinstance(timestamp, str):
+                try:
+                    dt = datetime.fromisoformat(timestamp)
+                    timestamp = format_timestamp(dt)
+                except:
+                    pass
+            
+            # Try to get guild name
+            guild_id = action.get("guild_id", "Unknown")
+            guild = bot.get_guild(int(guild_id)) if guild_id.isdigit() else None
+            guild_name = guild.name if guild else f"Unknown Guild ({guild_id})"
+            
+            recent_text += f"• {action['action'].title()} in {guild_name} - {timestamp}\n"
+        
+        embed.add_field(
+            name="Recent Actions",
+            value=recent_text,
+            inline=False
+        )
+    
+    return embed
+
+def format_leaderboard_embed(top_users, page=0, items_per_page=10):
+    """Format a leaderboard of users with most moderation actions"""
+    embed = discord.Embed(
+        title="Moderation Leaderboard",
+        description="Users with the most moderation actions against them",
+        color=discord.Color.red(),
+        timestamp=datetime.utcnow()
+    )
+    
+    # Calculate pagination
+    total_users = len(top_users)
+    total_pages = max(1, (total_users + items_per_page - 1) // items_per_page)
+    page = max(0, min(page, total_pages - 1))  # Ensure page is in valid range
+    
+    # Get the users for this page
+    start_idx = page * items_per_page
+    end_idx = min(start_idx + items_per_page, total_users)
+    page_users = top_users[start_idx:end_idx]
+    
+    # Add pagination info with navigation arrows
+    nav_text = f"Page {page+1}/{total_pages}"
+    if total_pages > 1:
+        if page > 0:
+            nav_text = f"◀️ {nav_text}"
+        if page < total_pages - 1:
+            nav_text = f"{nav_text} ▶️"
+    
+    embed.set_footer(text=f"{nav_text} • Today at {format_timestamp(datetime.utcnow())}")
+    
+    # If no users on this page
+    if not page_users:
+        embed.add_field(name="No Users", value="No users found for this page", inline=False)
+        return embed
+    
+    # Add leaderboard entries
+    leaderboard_text = ""
+    for i, (user_id, count) in enumerate(page_users, start=start_idx + 1):
+        try:
+            # Try to fetch the user
+            user = bot.get_user(int(user_id))
+            user_name = user.name if user else f"Unknown User ({user_id})"
+            
+            # Calculate reputation score
+            rep_score = calculate_reputation_score(user_id)
+            
+            leaderboard_text += f"**{i}. {user_name}** - {count} actions (Rep: {rep_score}/100)\n"
+        except Exception as e:
+            logging.error(f"Error formatting leaderboard entry for user {user_id}: {e}")
+            leaderboard_text += f"**{i}. Unknown User ({user_id})** - {count} actions\n"
+    
+    # Ensure the field value doesn't exceed Discord's limit
+    if len(leaderboard_text) > 1024:
+        leaderboard_text = leaderboard_text[:1000] + "...(truncated)"
+    
+    embed.add_field(name="Leaderboard", value=leaderboard_text, inline=False)
+    
+    return embed
+
+async def send_moderation_notification(user, guild, action_type, reason=None, moderator=None, timestamp=None, target_channel=None, skip_cross_guild_alert=False):
+    """Send a single, unified moderation notification with all necessary information"""
+    # Create a unique action ID
+    action_id = f"{action_type}-{user.id}-{guild.id}-{int(datetime.utcnow().timestamp())}"
+    
+    # Skip if we've already processed this action
+    if action_id in processed_actions:
+        return False
+        
+    # Add to processed actions
+    processed_actions.append(action_id)
+    
+    # Get the target channel if not provided
+    if not target_channel:
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            logging.warning(f"Target channel {TARGET_CHANNEL_ID} not found")
+            return False
+    
+    # Set color based on action type
+    color = discord.Color.gold()
+    if action_type.lower() == "ban":
+        color = discord.Color.red()
+    elif action_type.lower() == "kick":
+        color = discord.Color.orange()
+    
+    # Create the main notification embed
+    embed = discord.Embed(
+        title=f"Member {action_type.title()}ed",
+        description=f"{user.name} (ID: {user.id}) has been {action_type}ed from {guild.name}",
+        color=color,
+        timestamp=timestamp or datetime.utcnow()
+    )
+    
+    # Add moderator if available
+    if moderator:
+        embed.add_field(name="Moderator", value=f"{moderator}", inline=True)
+    
+    # Add reason if available
+    if reason:
+        # Truncate reason if it's too long
+        if len(reason) > 1000:
+            reason = reason[:997] + "..."
+        embed.add_field(name="Reason", value=reason, inline=False)
+    
+    # Add contact information for the guild owner
+    if guild.owner:
+        contact_text = f"Contact the server owner: {guild.owner.name} (ID: {guild.owner.id})"
+        # Ensure contact info doesn't exceed limit
+        if len(contact_text) > 1000:
+            contact_text = contact_text[:997] + "..."
+            
+        embed.add_field(
+            name="For More Information",
+            value=contact_text,
+            inline=False
+        )
+    
+    embed.set_footer(text=f"From {guild.name} • Today at {format_timestamp(timestamp or datetime.utcnow())}")
+    
+    # Send the main notification
+    try:
+        await target_channel.send(embed=embed)
+        logging.info(f"Sent {action_type} notification for {user.name}")
+    except Exception as e:
+        logging.error(f"Failed to send {action_type} notification: {e}")
+        return False
+    
+    # Check if user is in other guilds
+    other_guilds = []
+    for bot_guild in bot.guilds:
+        if bot_guild.id != guild.id:  # Skip the guild where the action happened
+            try:
+                # Try to fetch the member from this guild
+                member = await bot_guild.fetch_member(user.id)
+                if member:
+                    other_guilds.append(bot_guild)
+            except discord.NotFound:
+                # User is not in this guild
+                pass
+            except discord.Forbidden:
+                logging.warning(f"No permission to fetch members in guild {bot_guild.name}")
+            except Exception as e:
+                logging.error(f"Error checking if user is in guild {bot_guild.name}: {e}")
+    
+    # If user is in other guilds, send an alert (only if not skipped)
+    if other_guilds and not skip_cross_guild_alert:
+        guild_list = ", ".join([g.name for g in other_guilds])
+        
+        # Truncate guild list if it's too long
+        if len(guild_list) > 900:  # Leave room for the rest of the message
+            guild_list = guild_list[:897] + "..."
+        
+        alert_embed = discord.Embed(
+            title=f"⚠️ User {action_type.title()} Alert",
+            description=f"**{user.name}** (ID: {user.id}) was {action_type}ed from **{guild.name}** and is also present in these guilds: {guild_list}",
+            color=color,
+            timestamp=datetime.utcnow()
+        )
+        
+        # Add contact information for the source guild owner
+        if guild.owner:
+            contact_text = f"Contact the server owner of {guild.name}: {guild.owner.name} (ID: {guild.owner.id})"
+            # Ensure contact info doesn't exceed limit
+            if len(contact_text) > 1000:
+                contact_text = contact_text[:997] + "..."
+                
+            alert_embed.add_field(
+                name="For More Information",
+                value=contact_text,
+                inline=False
+            )
+        
+        alert_embed.set_footer(text=f"Cross-guild {action_type} notification • Today at {format_timestamp(datetime.utcnow())}")
+        try:
+            await target_channel.send(embed=alert_embed)
+            logging.info(f"Sent cross-guild alert for {action_type}ed user {user.name} in {len(other_guilds)} other guilds")
+        except Exception as e:
+            logging.error(f"Failed to send cross-guild alert: {e}")
+    
+    # Add to moderation history
+    add_moderation_action(
+        user.id,
+        guild.id,
+        action_type,
+        reason=reason,
+        moderator=moderator,
+        timestamp=(timestamp.isoformat() if timestamp else datetime.utcnow().isoformat())
+    )
+    
+    return True
+def contains_links(content):
+    """Check if the message contains any URLs"""
+    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
+    return bool(re.search(url_pattern, content))
+
+def sanitize_content(content):
+    """Sanitize message content to prevent formatting exploits and pings"""
+    # Escape markdown
+    content = escape_markdown(content)
+    
+    # Prevent @everyone and @here pings
+    content = content.replace('@everyone', '@\u200beveryone').replace('@here', '@\u200bhere')
+    
+    # Prevent user mentions
+    content = re.sub(r'<@!?(\d+)>', r'@user-\1', content)
+    
+    # Prevent role mentions
+    content = re.sub(r'<@&(\d+)>', r'@role-\1', content)
+    
+    # Prevent channel mentions
+    content = re.sub(r'<#(\d+)>', r'#channel-\1', content)
+    
+    return content
+
+def remove_links(content):
+    """Remove all URLs from the message content"""
+    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
+    return re.sub(url_pattern, '[link removed]', content)
+
+def is_important_moderation_message(message):
+    """Check if a message is related to important moderation actions (ban, kick, timeout)"""
+    # First check if it contains any excluded keywords
+    content_lower = message.content.lower()
+    
+    # Check if it's a voice channel join/leave message
+    for keyword in EXCLUDED_KEYWORDS:
+        if keyword in content_lower:
+            return False
+    
+    # Check message content for important moderation keywords
+    if any(keyword in content_lower for keyword in IMPORTANT_MODERATION_KEYWORDS):
+        return True
+        
+    # Check embeds for important moderation keywords
+    for embed in message.embeds:
+        # Check embed title
+        if embed.title and any(keyword in embed.title.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+            return True
+            
+        # Check embed description
+        if embed.description and any(keyword in embed.description.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+            return True
+            
+        # Check embed fields
+        for field in embed.fields:
+            if any(keyword in field.name.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+                return True
+            if field.value and any(keyword in field.value.lower() for keyword in IMPORTANT_MODERATION_KEYWORDS):
+                return True
+    
+    # Check for specific colors commonly used in moderation embeds
+    for embed in message.embeds:
+        # Red is commonly used for moderation actions
+        if embed.color and embed.color.value in [0xED4245, 0xFF0000, 0xF04747]:  # Various red colors
+            # But make sure it's not excluded
+            if embed.description:
+                if any(keyword in embed.description.lower() for keyword in EXCLUDED_KEYWORDS):
+                    return False
+            return True
+    
+    # Check for specific message patterns from Discord's built-in moderation
+    if "has been banned from the server" in message.content:
+        return True
+    if "has been kicked from the server" in message.content:
+        return True
+    if "has been timed out" in message.content:
+        return True
+    
+    return False
+
+async def handle_pagination_reaction(reaction, user, message_id, current_page, total_pages, user_id=None, command_type="history"):
+    """Handle pagination reactions for embeds"""
+    # Get the message
+    channel = reaction.message.channel
+    message = await channel.fetch_message(message_id)
+    
+    # Check which emoji was used
+    if str(reaction.emoji) == "◀️" and current_page > 0:
+        # Go to previous page
+        new_page = current_page - 1
+    elif str(reaction.emoji) == "▶️" and current_page < total_pages - 1:
+        # Go to next page
+        new_page = current_page + 1
+    else:
+        # Invalid reaction or no page change needed
+        return
+    
+    # Generate new embed based on command type
+    if command_type == "history" and user_id:
+        # Get user history
+        try:
+            target_user = await bot.fetch_user(int(user_id))
+            history = get_user_history(user_id)
+            new_embed = format_history_embed(target_user, history, page=new_page)
+        except Exception as e:
+            logging.error(f"Error generating history embed for pagination: {e}")
+            return
+    elif command_type == "leaderboard":
+        # Get leaderboard
+        try:
+            top_users = get_leaderboard(limit=100)  # Get more users for pagination
+            new_embed = format_leaderboard_embed(top_users, page=new_page)
+        except Exception as e:
+            logging.error(f"Error generating leaderboard embed for pagination: {e}")
+            return
+    else:
+        # Unsupported command type
+        return
+    
+    # Update the message with the new embed
+    try:
+        await message.edit(embed=new_embed)
+        # Remove the user's reaction
+        await reaction.remove(user)
+    except Exception as e:
+        logging.error(f"Error updating embed for pagination: {e}")
+@bot.event
+async def on_ready():
+    """Event triggered when the bot is ready."""
+    print(f"Logged in as {bot.user.name} ({bot.user.id})")
+    print("SafetyBot is now running!")
+    logging.info(f"Bot started: {bot.user.name} ({bot.user.id})")
+    
+    # Load moderation history
+    load_moderation_history()
+    
+    # Start the audit log checking task
+    check_audit_logs.start()
+    
+    # Register slash commands
+    try:
+        synced = await bot.tree.sync()
+        logging.info(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        logging.error(f"Failed to sync slash commands: {e}")
+
+@tasks.loop(seconds=AUDIT_CHECK_INTERVAL)
+async def check_audit_logs():
+    """Check audit logs periodically for moderation actions"""
+    try:
+        # Get the source channel's guild
+        source_channel = bot.get_channel(SOURCE_CHANNEL_ID)
+        if not source_channel:
+            logging.warning(f"Source channel {SOURCE_CHANNEL_ID} not found")
+            return
+            
+        guild = source_channel.guild
+        logging.debug(f"Checking audit logs for guild: {guild.name}")
+        
+        # Get the target channel
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            logging.warning(f"Target channel {TARGET_CHANNEL_ID} not found")
+            return
+            
+        # Initialize last check time for this guild if not exists
+        if guild.id not in last_audit_check:
+            # Use timezone-naive datetime
+            last_audit_check[guild.id] = datetime.utcnow().replace(tzinfo=None) - timedelta(minutes=5)
+            logging.debug(f"Initialized audit log check time for {guild.name}")
+            
+        # Get audit log entries - check more entries to ensure we don't miss any
+        try:
+            # Increase the limit to process more entries
+            async for entry in guild.audit_logs(limit=AUDIT_LOG_LIMIT):
+                # Create a unique ID for this entry to avoid duplicates
+                entry_id = f"{entry.id}-{entry.action}-{entry.created_at}"
+                
+                # Skip if we've already processed this entry
+                if entry_id in processed_audit_entries:
+                    continue
+                    
+                # Add to processed entries
+                processed_audit_entries.append(entry_id)
+                
+                # Convert entry created_at to naive datetime for comparison
+                entry_created_at = entry.created_at
+                if entry_created_at.tzinfo:
+                    entry_created_at = entry_created_at.replace(tzinfo=None)
+                
+                # Update the last check time
+                if entry_created_at > last_audit_check[guild.id]:
+                    last_audit_check[guild.id] = entry_created_at
+                
+                # Check if this is a moderation action we care about
+                if entry.action == discord.AuditLogAction.ban:
+                    # Use the centralized notification function
+                    await send_moderation_notification(
+                        entry.target,
+                        guild,
+                        "ban",
+                        reason=entry.reason,
+                        moderator=entry.user,
+                        timestamp=entry.created_at,
+                        target_channel=target_channel
+                    )
+                elif entry.action == discord.AuditLogAction.kick:
+                    # Use the centralized notification function
+                    await send_moderation_notification(
+                        entry.target,
+                        guild,
+                        "kick",
+                        reason=entry.reason,
+                        moderator=entry.user,
+                        timestamp=entry.created_at,
+                        target_channel=target_channel,
+                        skip_cross_guild_alert=True  # Skip the cross-guild alert for kicks
+                    )
+                elif entry.action == discord.AuditLogAction.member_update:
+                    # Check if this is a timeout (communication disabled)
+                    if hasattr(entry, 'after') and hasattr(entry.after, 'timed_out_until') and entry.after.timed_out_until:
+                        # Use the centralized notification function
+                        await send_moderation_notification(
+                            entry.target,
+                            guild,
+                            "timeout",
+                            reason=entry.reason,
+                            moderator=entry.user,
+                            timestamp=entry.created_at,
+                            target_channel=target_channel
+                        )
+            
+        except discord.Forbidden:
+            logging.error(f"No permission to view audit logs in {guild.name}")
+        except Exception as e:
+            logging.error(f"Error checking audit logs: {e}")
+            
+    except Exception as e:
+        logging.error(f"Error in check_audit_logs task: {e}")
+
+@bot.event
+async def on_member_ban(guild, user):
+    """Event triggered when a member is banned"""
+    try:
+        # Only process if it's from our source guild
+        source_channel = bot.get_channel(SOURCE_CHANNEL_ID)
+        if not source_channel or guild.id != source_channel.guild.id:
+            return
+            
+        # Get the target channel
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            return
+            
+        logging.info(f"Ban event detected for {user.name} in {guild.name}")
+        
+        # Use the centralized notification function
+        await send_moderation_notification(
+            user,
+            guild,
+            "ban",
+            moderator="Unknown (from event)",
+            target_channel=target_channel
+        )
+    
+    except Exception as e:
+        logging.error(f"Error handling ban event: {e}")
+
+@bot.event
+async def on_member_remove(member):
+    """Event triggered when a member leaves or is kicked"""
+    try:
+        # Only process if it's from our source guild
+        source_channel = bot.get_channel(SOURCE_CHANNEL_ID)
+        if not source_channel or member.guild.id != source_channel.guild.id:
+            return
+            
+        # Get the target channel
+        target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not target_channel:
+            return
+            
+        # Wait a moment to allow the audit log to update
+        await asyncio.sleep(2)
+        
+        # Check if this was a kick by looking at recent audit logs
+        try:
+            was_kicked = False
+            kick_entry = None
+            
+            async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
+                if entry.target.id == member.id and (datetime.utcnow() - entry.created_at.replace(tzinfo=None)).total_seconds() < 10:
+                    # This was a kick
+                    was_kicked = True
+                    kick_entry = entry
+                    logging.info(f"Kick detected for {member.name} in {member.guild.name}")
+                    
+                    # Use the centralized notification function
+                    await send_moderation_notification(
+                        member,
+                        member.guild,
+                        "kick",
+                        reason=entry.reason,
+                        moderator=entry.user,
+                        timestamp=entry.created_at,
+                        target_channel=target_channel,
+                        skip_cross_guild_alert=True  # Skip the cross-guild alert for kicks
+                    )
+                    break  # Exit after finding the kick
+        
+        except discord.Forbidden:
+            logging.error(f"No permission to view audit logs in {member.guild.name}")
+        except Exception as e:
+            logging.error(f"Error checking if member was kicked: {e}")
+    
+    except Exception as e:
+        logging.error(f"Error handling member remove event: {e}")
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    """Event triggered when a reaction is added to a message"""
+    # Ignore reactions from the bot itself
+    if user.id == bot.user.id:
+        return
+    
+    # Check if this is a pagination reaction
+    if str(reaction.emoji) in ["◀️", "▶️"]:
+        # Check if the message is from the bot
+        if reaction.message.author.id == bot.user.id:
+            # Check if the message has an embed with pagination info
+            if reaction.message.embeds:
+                embed = reaction.message.embeds[0]
+                if embed.footer and embed.footer.text:
+                    # Try to extract pagination info
+                    footer_text = embed.footer.text
+                    page_match = re.search(r"Page (\d+)/(\d+)", footer_text)
+                    if page_match:
+                        current_page = int(page_match.group(1)) - 1  # Convert to 0-based
+                        total_pages = int(page_match.group(2))
+                        
+                        # Determine command type and user ID
+                        command_type = "history"
+                        user_id = None
+                        
+                        if "Moderation History for" in embed.title:
+                            command_type = "history"
+                            # Extract user ID from description
+                            id_match = re.search(r"User ID: (\d+)", embed.description)
+                            if id_match:
+                                user_id = id_match.group(1)
+                        elif "Moderation Leaderboard" in embed.title:
+                            command_type = "leaderboard"
+                        
+                        # Handle the pagination
+                        await handle_pagination_reaction(
+                            reaction, user, reaction.message.id, 
+                            current_page, total_pages, user_id, command_type
+                        )
+# Traditional command
+@bot.command(name="history")
+async def history_command(ctx, user_id: int = None, page: int = 0):
+    """Display moderation history for a user"""
+    # Check if command is used in the target channel
+    if ctx.channel.id != TARGET_CHANNEL_ID:
+        return
+        
+    if not user_id:
+        await ctx.send("Please provide a user ID. Usage: `!history <user_id> [page]`")
+        return
+        
+    try:
+        # Try to fetch the user
+        user = await bot.fetch_user(user_id)
+        if not user:
+            await ctx.send(f"Could not find user with ID {user_id}")
+            return
+            
+        # Get user history
+        history = get_user_history(user_id)
+        if not history:
+            await ctx.send(f"No moderation history found for {user.name} (ID: {user_id})")
+            return
+            
+        # Format and send the history embed with pagination
+        history_embed = format_history_embed(user, history, page=page)
+        message = await ctx.send(embed=history_embed)
+        
+        # Add pagination reactions if needed
+        if "Page" in history_embed.footer.text and "/" in history_embed.footer.text:
+            page_info = re.search(r"Page (\d+)/(\d+)", history_embed.footer.text)
+            if page_info:
+                current_page = int(page_info.group(1))
+                total_pages = int(page_info.group(2))
+                
+                if current_page > 1:  # Not on first page
+                    await message.add_reaction("◀️")
+                if current_page < total_pages:  # Not on last page
+                    await message.add_reaction("▶️")
+        
+        logging.info(f"History command used for user {user.name} by {ctx.author.name}")
+        
+    except discord.NotFound:
+        await ctx.send(f"Could not find user with ID {user_id}")
+    except Exception as e:
+        logging.error(f"Error processing history command: {e}")
+        await ctx.send(f"Error processing request: {str(e)}")
+
+# Slash command version
+@bot.tree.command(name="history", description="Display moderation history for a user")
+async def history_slash(interaction: discord.Interaction, user_id: str, page: int = 0):
+    """Display moderation history for a user using slash command"""
+    # Check if command is used in the target channel
+    if interaction.channel_id != TARGET_CHANNEL_ID:
+        await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
+        return
+        
+    try:
+        # Convert user_id to int
+        user_id_int = int(user_id)
+        
+        # Try to fetch the user
+        user = await bot.fetch_user(user_id_int)
+        if not user:
+            await interaction.response.send_message(f"Could not find user with ID {user_id}", ephemeral=True)
+            return
+            
+        # Get user history
+        history = get_user_history(user_id_int)
+        if not history:
+            await interaction.response.send_message(f"No moderation history found for {user.name} (ID: {user_id})", ephemeral=True)
+            return
+            
+        # Format and send the history embed with pagination
+        history_embed = format_history_embed(user, history, page=page)
+        await interaction.response.send_message(embed=history_embed)
+        
+        # Get the message to add reactions
+        message = await interaction.original_response()
+        
+        # Add pagination reactions if needed
+        if "Page" in history_embed.footer.text and "/" in history_embed.footer.text:
+            page_info = re.search(r"Page (\d+)/(\d+)", history_embed.footer.text)
+            if page_info:
+                current_page = int(page_info.group(1))
+                total_pages = int(page_info.group(2))
+                
+                if current_page > 1:  # Not on first page
+                    await message.add_reaction("◀️")
+                if current_page < total_pages:  # Not on last page
+                    await message.add_reaction("▶️")
+        
+        logging.info(f"History slash command used for user {user.name} by {interaction.user.name}")
+        
+    except ValueError:
+        await interaction.response.send_message("Please provide a valid user ID (numbers only)", ephemeral=True)
+    except discord.NotFound:
+        await interaction.response.send_message(f"Could not find user with ID {user_id}", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error processing history slash command: {e}")
+        await interaction.response.send_message(f"Error processing request: {str(e)}", ephemeral=True)
+
+# Show profile command
+@bot.tree.command(name="show_profile", description="Show a user's profile across all servers")
+async def show_profile_slash(interaction: discord.Interaction, user_id: str):
+    """Show a user's profile across all servers the bot is in"""
+    # Check if command is used in the target channel
+    if interaction.channel_id != TARGET_CHANNEL_ID:
+        await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
+        return
+        
+    try:
+        # Convert user_id to int
+        user_id_int = int(user_id)
+        
+        # Try to fetch the user
+        user = await bot.fetch_user(user_id_int)
+        if not user:
+            await interaction.response.send_message(f"Could not find user with ID {user_id}", ephemeral=True)
+            return
+            
+        # Get user roles in all guilds
+        roles_in_guilds = get_user_roles_in_guilds(user_id_int)
+        
+        if not roles_in_guilds:
+            await interaction.response.send_message(f"User {user.name} is not in any servers where I have access.", ephemeral=True)
+            return
+            
+        # Format and send the profile embed
+        profile_embed = format_profile_embed(user, roles_in_guilds)
+        await interaction.response.send_message(embed=profile_embed)
+        
+        logging.info(f"Show profile command used for user {user.name} by {interaction.user.name}")
+        
+    except ValueError:
+        await interaction.response.send_message("Please provide a valid user ID (numbers only)", ephemeral=True)
+    except discord.NotFound:
+        await interaction.response.send_message(f"Could not find user with ID {user_id}", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error processing show profile command: {e}")
+        await interaction.response.send_message(f"Error processing request: {str(e)}", ephemeral=True)
+
+# Reputation command
+@bot.tree.command(name="rep", description="Check a user's reputation score")
+async def reputation_slash(interaction: discord.Interaction, user_id: str):
+    """Check a user's reputation score based on moderation history"""
+    # Check if command is used in the target channel
+    if interaction.channel_id != TARGET_CHANNEL_ID:
+        await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
+        return
+        
+    try:
+        # Convert user_id to int
+        user_id_int = int(user_id)
+        
+        # Try to fetch the user
+        user = await bot.fetch_user(user_id_int)
+        if not user:
+            await interaction.response.send_message(f"Could not find user with ID {user_id}", ephemeral=True)
+            return
+            
+        # Get user history
+        history = get_user_history(user_id_int)
+        
+        # Calculate reputation score
+        rep_score = calculate_reputation_score(user_id_int)
+        
+        # Format and send the reputation embed
+        rep_embed = format_reputation_embed(user, rep_score, history)
+        await interaction.response.send_message(embed=rep_embed)
+        
+        logging.info(f"Reputation command used for user {user.name} by {interaction.user.name}")
+        
+    except ValueError:
+        await interaction.response.send_message("Please provide a valid user ID (numbers only)", ephemeral=True)
+    except discord.NotFound:
+        await interaction.response.send_message(f"Could not find user with ID {user_id}", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error processing reputation command: {e}")
+        await interaction.response.send_message(f"Error processing request: {str(e)}", ephemeral=True)
+
+# Leaderboard command
+@bot.tree.command(name="leaderboard", description="Show users with the most moderation actions")
+async def leaderboard_slash(interaction: discord.Interaction, page: int = 0):
+    """Show users with the most moderation actions against them"""
+    # Check if command is used in the target channel
+    if interaction.channel_id != TARGET_CHANNEL_ID:
+        await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
+        return
+        
+    try:
+        # Get leaderboard data
+        top_users = get_leaderboard(limit=100)  # Get more users for pagination
+        
+        if not top_users:
+            await interaction.response.send_message("No moderation history found for any users.", ephemeral=True)
+            return
+            
+        # Format and send the leaderboard embed
+        leaderboard_embed = format_leaderboard_embed(top_users, page=page)
+        await interaction.response.send_message(embed=leaderboard_embed)
+        
+        # Get the message to add reactions
+        message = await interaction.original_response()
+        
+        # Add pagination reactions if needed
+        if "Page" in leaderboard_embed.footer.text and "/" in leaderboard_embed.footer.text:
+            page_info = re.search(r"Page (\d+)/(\d+)", leaderboard_embed.footer.text)
+            if page_info:
+                current_page = int(page_info.group(1))
+                total_pages = int(page_info.group(2))
+                
+                if current_page > 1:  # Not on first page
+                    await message.add_reaction("◀️")
+                if current_page < total_pages:  # Not on last page
+                    await message.add_reaction("▶️")
+        
+        logging.info(f"Leaderboard command used by {interaction.user.name}")
+        
+    except Exception as e:
+        logging.error(f"Error processing leaderboard command: {e}")
+        await interaction.response.send_message(f"Error processing request: {str(e)}", ephemeral=True)
+
+# Admin command to reload moderation history
+@bot.command(name="reload_history")
+async def reload_history_command(ctx):
+    """Admin command to reload moderation history from file"""
+    # Check if command is used in the target channel and by an authorized user
+    if ctx.channel.id != TARGET_CHANNEL_ID:
+        return
+        
+    # Check if user is authorized
+    user_authorized = (ctx.author.id in AUTHORIZED_USERS or 
+                    any(role.id in AUTHORIZED_ROLES for role in ctx.author.roles if hasattr(ctx.author, 'roles')))
+    
+    if not user_authorized:
+        await ctx.send("You don't have permission to use this command.")
+        return
+        
+    try:
+        load_moderation_history()
+        await ctx.send(f"Reloaded moderation history for {len(moderation_history)} users")
+        logging.info(f"Moderation history reloaded by {ctx.author.name}")
+    except Exception as e:
+        logging.error(f"Error reloading moderation history: {e}")
+        await ctx.send(f"Error reloading moderation history: {str(e)}")
+
+# Slash command version for reloading history
+@bot.tree.command(name="reload_history", description="Reload moderation history from file")
+async def reload_history_slash(interaction: discord.Interaction):
+    """Admin command to reload moderation history from file using slash command"""
+    # Check if command is used in the target channel
+    if interaction.channel_id != TARGET_CHANNEL_ID:
+        await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
+        return
+        
+    # Check if user is authorized
+    user_authorized = (interaction.user.id in AUTHORIZED_USERS or 
+                    any(role.id in AUTHORIZED_ROLES for role in interaction.user.roles if hasattr(interaction.user, 'roles')))
+    
+    if not user_authorized:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+        
+    try:
+        load_moderation_history()
+        await interaction.response.send_message(f"Reloaded moderation history for {len(moderation_history)} users")
+        logging.info(f"Moderation history reloaded by {interaction.user.name}")
+    except Exception as e:
+        logging.error(f"Error reloading moderation history: {e}")
+        await interaction.response.send_message(f"Error reloading moderation history: {str(e)}", ephemeral=True)
+@bot.event 
+async def on_message(message):
+    """Event triggered when a message is sent in any channel the bot can see."""
+    # Ignore messages from the bot itself to prevent loops
+    if message.author == bot.user:
+        return
+    
+    # Process commands first
+    await bot.process_commands(message)
+    
+    # Check if the message is from the source channel
+    if message.channel.id == SOURCE_CHANNEL_ID:
+        try:
+            # Check if this is a bot message
+            is_bot_message = message.author.bot
+            
+            # For bot messages, only forward if they're important moderation-related
+            if is_bot_message:
+                # Skip if not an important moderation message
+                if not is_important_moderation_message(message):
+                    return
+                
+                logging.info(f"Processing important moderation message from {message.author.name}")
+                
+                # Create a unique action ID for this message
+                action_id = f"bot-message-{message.id}-{message.channel.id}-{int(datetime.utcnow().timestamp())}"
+                
+                # Skip if we've already processed this message
+                if action_id in processed_actions:
+                    return
+                    
+                # Add to processed actions
+                processed_actions.append(action_id)
+                
+                # Try to extract user information from the message for history tracking
+                # This is complex and depends on the format of moderation messages from different bots
+                # Here's a simple example for common formats
+                user_id = None
+                action_type = None
+                reason = None
+                
+                if message.mentions:
+                    mentioned_user = message.mentions[0]
+                    user_id = mentioned_user.id
+                    
+                    content_lower = message.content.lower()
+                    if "ban" in content_lower:
+                        action_type = "ban"
+                    elif "kick" in content_lower:
+                        action_type = "kick"
+                    elif "timeout" in content_lower or "timed out" in content_lower:
+                        action_type = "timeout"
+                    
+                    # Try to extract reason
+                    reason_match = re.search(r"reason:?\s*(.+?)(?:\.|$)", message.content, re.IGNORECASE)
+                    if reason_match:
+                        reason = reason_match.group(1).strip()
+                
+                # If we identified a moderation action, add it to history
+                if user_id and action_type:
+                    # Create a unique action ID
+                    mod_action_id = f"{action_type}-{user_id}-{message.guild.id}-{int(datetime.utcnow().timestamp())}"
+                    
+                    # Skip if we've already processed this action
+                    if mod_action_id not in processed_actions:
+                        processed_actions.append(mod_action_id)
+                        
+                        add_moderation_action(
+                            user_id,
+                            message.guild.id,
+                            action_type,
+                            reason=reason,
+                            moderator=message.author
+                        )
+                        logging.info(f"Added {action_type} action from bot message for user {user_id}")
+                
+                # Get the target channel
+                target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+                
+                if not target_channel:
+                    logging.error(f"Target channel {TARGET_CHANNEL_ID} not found")
+                    return
+                
+                # Special handling for bot messages
+                if is_bot_message:
+                    # Forward the message content if it exists
+                    if message.content.strip():
+                        # Truncate if too long
+                        content = message.content
+                        if len(content) > 1900:  # Leave room for the prefix
+                            content = content[:1897] + "..."
+                            
+                        bot_message = f"**Moderation Action from {message.author.name} in {message.guild.name}**\n{content}"
+                        await target_channel.send(bot_message)
+                    
+                    # Forward all embeds from the bot
+                    if message.embeds:
+                        logging.info(f"Forwarding {len(message.embeds)} moderation embeds from {message.author.name}")
+                        for embed in message.embeds:
+                            try:
+                                # Create a copy of the embed to ensure it's forwarded correctly
+                                new_embed = discord.Embed.from_dict(embed.to_dict())
+                                
+                                # Add source information to the embed footer
+                                footer_text = f"From {message.guild.name} • Today at {format_timestamp(datetime.utcnow())}"
+                                if new_embed.footer.text:
+                                    # Truncate if too long
+                                    combined_footer = f"{new_embed.footer.text} | {footer_text}"
+                                    if len(combined_footer) > 2000:
+                                        combined_footer = combined_footer[:1997] + "..."
+                                    new_embed.set_footer(text=combined_footer)
+                                else:
+                                    new_embed.set_footer(text=footer_text)
+                                    
+                                await target_channel.send(embed=new_embed)
+                            except Exception as e:
+                                logging.error(f"Error forwarding embed: {e}")
+                                # Try sending as plain text if embed fails
+                                try:
+                                    embed_dict = embed.to_dict()
+                                    embed_text = "**Embed Content:**\n"
+                                    
+                                    if 'title' in embed_dict:
+                                        embed_text += f"**Title:** {embed_dict['title']}\n"
+                                    if 'description' in embed_dict:
+                                        embed_text += f"**Description:** {embed_dict['description']}\n"
+                                    if 'fields' in embed_dict:
+                                        for field in embed_dict['fields']:
+                                            embed_text += f"**{field['name']}:** {field['value']}\n"
+                                    
+                                    # Truncate if too long
+                                    if len(embed_text) > 2000:
+                                        embed_text = embed_text[:1997] + "..."
+                                        
+                                    await target_channel.send(embed_text)
+                                except Exception as e2:
+                                    logging.error(f"Error forwarding embed as text: {e2}")
+            else:
+                # Regular user authorization check
+                user_authorized = (message.author.id in AUTHORIZED_USERS or 
+                                any(role.id in AUTHORIZED_ROLES for role in message.author.roles if hasattr(message.author, 'roles')))
+                
+                if not user_authorized and AUTHORIZED_USERS:  # Skip check if no authorized users defined
+                    logging.warning(f"Unauthorized message from {message.author.name} ignored")
+                    return
+                
+                # Apply rate limiting
+                current_time = time.time()
+                user_id = message.author.id
+                
+                if current_time - message_cooldowns[user_id] < COOLDOWN_PERIOD:
+                    message_counts[user_id] += 1
+                    if message_counts[user_id] > MAX_MESSAGES_PER_MINUTE:
+                        logging.warning(f"Rate limit exceeded for {message.author.name}")
+                        return
+                else:
+                    message_counts[user_id] = 1
+                    
+                message_cooldowns[user_id] = current_time
+            
+                # Skip empty messages unless they have embeds
+                if not message.content.strip() and not message.embeds:
+                    return
+                    
+                # Get the target channel
+                target_channel = bot.get_channel(TARGET_CHANNEL_ID)
+                
+                if not target_channel:
+                    logging.error(f"Target channel {TARGET_CHANNEL_ID} not found")
+                    return
+                
+                # Regular user message - forward as text only
+                processed_content = message.content
+                
+                # Check for links and remove if needed
+                has_links = contains_links(processed_content)
+                if has_links:
+                    processed_content = remove_links(processed_content)
+                    logging.info(f"Links removed from message by {message.author.name}")
+                
+                # Sanitize the message content
+                safe_content = sanitize_content(processed_content)
+                
+                # Truncate if too long
+                if len(safe_content) > 1800:  # Leave room for the attribution
+                    safe_content = safe_content[:1797] + "..."
+                
+                # Create the forwarded message with full attribution
+                forwarded_content = (
+                    f"**Message from {message.guild.name}**\n"
+                    f"**User:** {message.author.name}\n"
+                    f"**Channel:** #{message.channel.name}\n"
+                    f"**Content:** {safe_content}"
+                )
+                
+                # Note if attachments were blocked
+                if message.attachments:
+                    forwarded_content += f"\n\n**Note:** {len(message.attachments)} attachment(s) were not forwarded."
+                
+                # Send the text-only message to the target channel
+                await target_channel.send(forwarded_content)
+                
+                # Forward embeds if present
+                if message.embeds:
+                    for embed in message.embeds:
+                        try:
+                            await target_channel.send(embed=embed)
+                        except Exception as e:
+                            logging.error(f"Error forwarding embed: {e}")
+                            # Try sending as plain text if embed fails
+                            try:
+                                embed_dict = embed.to_dict()
+                                embed_text = "**Embed Content:**\n"
+                                
+                                if 'title' in embed_dict:
+                                    embed_text += f"**Title:** {embed_dict['title']}\n"
+                                if 'description' in embed_dict:
+                                    embed_text += f"**Description:** {embed_dict['description']}\n"
+                                if 'fields' in embed_dict:
+                                    for field in embed_dict['fields']:
+                                        embed_text += f"**{field['name']}:** {field['value']}\n"
+                                
+                                # Truncate if too long
+                                if len(embed_text) > 2000:
+                                    embed_text = embed_text[:1997] + "..."
+                                    
+                                await target_channel.send(embed_text)
+                            except Exception as e2:
+                                logging.error(f"Error forwarding embed as text: {e2}")
+            
+            # Log the successful forward
+            logging.info(
+                f"FORWARD: {message.author.id} ({message.author.name}) "
+                f"from {message.guild.id} ({message.guild.name}) - Content length: {len(message.content)}"
+            )
+            
+        except Exception as e:
+            logging.error(f"Error forwarding message: {e}")
+
+# Run the bot
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        print("Error: No Discord token found. Please set DISCORD_TOKEN in .env file.")
+        logging.critical("No Discord token found. Bot startup failed.")
+    else:
+        print("Starting bot...")
+        bot.run(BOT_TOKEN)
