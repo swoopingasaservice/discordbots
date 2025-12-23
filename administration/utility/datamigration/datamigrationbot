@@ -1,0 +1,108 @@
+import discord
+from discord import app_commands
+import asyncio
+from datetime import datetime
+
+intents = discord.Intents.default()
+intents.message_content = True 
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+
+def log_event(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open("migration_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {message}\n")
+    print(f"[{timestamp}] {message}")
+
+@bot.event
+async def on_ready():
+    log_event(f"Logged in as {bot.user}")
+    await tree.sync()
+    print("Slash commands synced!")
+
+@tree.command(name="migrate_resources", description="Sync text channels to a forum as separate posts")
+@app_commands.describe(
+    source_category_id="The ID of the category containing your text channels",
+    forum_channel_id="The ID of the 'educational-resources' forum channel"
+)
+async def migrate_resources(interaction: discord.Interaction, source_category_id: str, forum_channel_id: str):
+    await interaction.response.send_message("🚀 Starting migration... Check migration_log.txt for updates.", ephemeral=True)
+    
+    guild = interaction.guild
+    source_category = guild.get_channel(int(source_category_id))
+    forum_channel = guild.get_channel(int(forum_channel_id))
+
+    if not isinstance(source_category, discord.CategoryChannel) or not isinstance(forum_channel, discord.ForumChannel):
+        log_event("ERROR: Invalid IDs.")
+        return
+
+    for text_channel in source_category.text_channels:
+        try:
+            # Replace hyphens with spaces for the title
+            clean_title = text_channel.name.replace("-", " ")
+            
+            log_event(f"Syncing channel: #{text_channel.name} as '{clean_title}'")
+            
+            # Create the Forum Post (Thread)
+            # Initial content is now just the clean title
+            thread_with_post = await forum_channel.create_thread(
+                name=clean_title,
+                content=f"# {clean_title}"
+            )
+            archive_thread = thread_with_post.thread
+
+            buffer = ""
+            msg_count = 0
+            
+            async for message in text_channel.history(limit=None, oldest_first=True):
+                if message.author.bot: continue
+                
+                msg_count += 1
+                entry = f"**{message.author.display_name}**: {message.content}\n"
+                
+                if len(buffer) + len(entry) > 1900:
+                    await archive_thread.send(buffer)
+                    buffer = entry
+                    await asyncio.sleep(1.2) 
+                else:
+                    buffer += entry
+
+            if buffer:
+                await archive_thread.send(buffer)
+
+            log_event(f"SUCCESS: {clean_title} synced ({msg_count} messages).")
+            await asyncio.sleep(2) 
+
+        except Exception as e:
+            log_event(f"FAILED: {text_channel.name}. Error: {e}")
+
+    log_event("--- MIGRATION FINISHED ---")
+
+@tree.command(name="add_image_to_post", description="Edit a specific forum starter message to add an image")
+@app_commands.describe(
+    message_id="The ID of the message you want to edit",
+    image_url="The direct URL of the image to display"
+)
+async def add_image_to_post(interaction: discord.Interaction, message_id: str, image_url: str):
+    # This command works best if used inside the forum thread itself
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Fetch the message using the provided ID
+        target_message = await interaction.channel.fetch_message(int(message_id))
+        
+        # Create an embed to show the image nicely
+        embed = discord.Embed(color=discord.Color.blue())
+        embed.set_image(url=image_url)
+        
+        # Edit the message. We keep the current content but add the embed.
+        await target_message.edit(embed=embed)
+        
+        await interaction.followup.send(f"✅ Image successfully added to message {message_id}!", ephemeral=True)
+        log_event(f"MANUAL UPDATE: Added image to message {message_id}")
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+        log_event(f"ERROR: Could not add image to {message_id}. {e}")
+      
+bot.run('YOUR_BOT_TOKEN')
